@@ -1,6 +1,6 @@
 [package]
 name = "libc-rs"
-version = "0.0.1"
+version = "0.1.0"
 publish = ["crates-io"]
 edition = "2024"
 rust-version = "1.85"
@@ -13,6 +13,8 @@ keywords = ["unikernel", "no-std", "runtime", "aarch64", "syscall"]
 categories = ["no-std", "os"]
 
 [features]
-default = []
+default = ["alloc"]
 alloc = []
-compiler-builtins = []
+# Export freestanding C-ABI memory/string symbols (`memcpy`, `memmove`, `memset`, `memcmp`, `bcmp`, `strlen`, `strnlen`)
+# for `aarch64-unknown-none` targets.
+symbols = []

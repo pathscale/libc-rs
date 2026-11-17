@@ -10,5 +10,16 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-/// ABI contract version for the native unikernel application interface.
-pub const ABI_VERSION: u64 = 1;
+pub mod boot;
+pub mod channel;
+pub mod clock;
+pub mod cpu;
+pub mod entropy;
+pub mod heap;
+pub mod mem;
+pub mod rt;
+pub mod status;
+pub mod trap;
+
+pub use status::{Result, Status};
+pub use trap::{ABI_VERSION, DEFAULT_NAMESPACE, Op, check_version, exit};
