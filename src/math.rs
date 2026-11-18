@@ -107,52 +107,6 @@ pub fn trunc(x: f64) -> f64 {
     }
 }
 
-/// Returns the square root of `x`.
-#[must_use]
-#[inline]
-pub fn sqrt(x: f64) -> f64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let out: f64;
-        // SAFETY: `fsqrt` is a pure scalar floating-point instruction with no memory side effects.
-        unsafe {
-            core::arch::asm!(
-                "fsqrt {:d}, {:d}",
-                out(vreg) out,
-                in(vreg) x,
-                options(pure, nomem, nostack),
-            );
-        }
-        out
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        if x.is_nan() || x == f64::INFINITY || x == 0.0 {
-            return x;
-        }
-        if x < 0.0 {
-            return f64::NAN;
-        }
-        let mut norm = x;
-        let mut exp_adjust = 0i32;
-        if norm < f64::from_bits(0x0010_0000_0000_0000) {
-            norm *= (1u64 << 52) as f64;
-            exp_adjust = -26;
-        }
-        let mut y = f64::from_bits((norm.to_bits() >> 1) + 0x1ff8_0000_0000_0000);
-        y = 0.5 * (y + norm / y);
-        y = 0.5 * (y + norm / y);
-        y = 0.5 * (y + norm / y);
-        y = 0.5 * (y + norm / y);
-        y = 0.5 * (y + norm / y);
-        y = 0.5 * (y + norm / y);
-        if exp_adjust != 0 {
-            y *= f64::from_bits(((1023 + exp_adjust) as u64) << 52);
-        }
-        y
-    }
-}
-
 /// Computes the natural logarithm $\ln(x)$ using the FDLIBM minimax approximation.
 #[must_use]
 pub fn ln(x: f64) -> f64 {
@@ -198,8 +152,7 @@ pub fn ln(x: f64) -> f64 {
 }
 
 /// Computes $e^x$ using the FDLIBM range reduction and Remez rational approximation.
-#[must_use]
-pub fn exp(x: f64) -> f64 {
+fn exp(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }
@@ -388,14 +341,6 @@ mod tests {
         assert_eq!(trunc(-2.9), -2.0);
         assert_eq!(trunc(-0.5).to_bits(), (-0.0f64).to_bits());
         assert!(trunc(f64::NAN).is_nan());
-
-        assert_eq!(sqrt(0.0), 0.0);
-        assert_eq!(sqrt(4.0), 2.0);
-        assert_eq!(sqrt(9.0), 3.0);
-        assert_eq!(sqrt(2.25), 1.5);
-        assert!(sqrt(-1.0).is_nan());
-        assert_eq!(sqrt(f64::INFINITY), f64::INFINITY);
-        assert!(rel_err(sqrt(2.0), core::f64::consts::SQRT_2) < 1e-15);
     }
 
     #[test]

@@ -53,11 +53,6 @@ pub const EFD_NONBLOCK: i32 = 0x800;
 /// Set the close-on-exec (`FD_CLOEXEC`) flag on the new `eventfd` descriptor.
 pub const EFD_CLOEXEC: i32 = 0x80000;
 
-/// Set the `O_NONBLOCK` file status flag on the timerfd open file description.
-pub const TFD_NONBLOCK: i32 = 0x800;
-/// Set the close-on-exec (`FD_CLOEXEC`) flag on the timerfd descriptor.
-pub const TFD_CLOEXEC: i32 = 0x80000;
-
 /// Kernel `struct pollfd` descriptor entry.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

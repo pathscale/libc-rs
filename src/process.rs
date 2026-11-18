@@ -3,7 +3,6 @@
 use core::mem::size_of;
 
 use crate::errno::SysResult;
-use crate::fd::RawFd;
 use crate::raw::{nr, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5};
 use crate::time::Timeval;
 
@@ -184,13 +183,6 @@ pub fn getpid() -> i32 {
     unsafe { syscall0(nr::GETPID).unwrap_or(0) as i32 }
 }
 
-/// Returns the process ID of the parent of the calling process.
-#[must_use]
-pub fn getppid() -> i32 {
-    // SAFETY: `GETPPID` has no memory side effects.
-    unsafe { syscall0(nr::GETPPID).unwrap_or(0) as i32 }
-}
-
 /// Returns the caller's thread ID (`TID`).
 #[must_use]
 pub fn gettid() -> i32 {
@@ -226,38 +218,6 @@ pub fn getegid() -> u32 {
     unsafe { syscall0(nr::GETEGID).unwrap_or(0) as u32 }
 }
 
-/// Sets the real, effective, and saved user IDs of the calling process.
-pub fn setresuid(ruid: u32, euid: u32, suid: u32) -> SysResult<()> {
-    // SAFETY: `SETRESUID` takes three scalar UID arguments.
-    unsafe {
-        syscall3(nr::SETRESUID, ruid as usize, euid as usize, suid as usize)?;
-    }
-    Ok(())
-}
-
-/// Sets the real, effective, and saved group IDs of the calling process.
-pub fn setresgid(rgid: u32, egid: u32, sgid: u32) -> SysResult<()> {
-    // SAFETY: `SETRESGID` takes three scalar GID arguments.
-    unsafe {
-        syscall3(nr::SETRESGID, rgid as usize, egid as usize, sgid as usize)?;
-    }
-    Ok(())
-}
-
-/// Sets the supplementary group IDs for the calling process.
-pub fn setgroups(groups: &[u32]) -> SysResult<()> {
-    let ptr = if groups.is_empty() {
-        0
-    } else {
-        groups.as_ptr() as usize
-    };
-    // SAFETY: `groups` is a valid slice of `u32` of length `groups.len()`.
-    unsafe {
-        syscall2(nr::SETGROUPS, groups.len(), ptr)?;
-    }
-    Ok(())
-}
-
 /// Sets the process group ID (`pgid`) of the process specified by `pid`.
 pub fn setpgid(pid: i32, pgid: i32) -> SysResult<()> {
     // SAFETY: `SETPGID` takes two scalar PID arguments.
@@ -265,12 +225,6 @@ pub fn setpgid(pid: i32, pgid: i32) -> SysResult<()> {
         syscall2(nr::SETPGID, pid as usize, pgid as usize)?;
     }
     Ok(())
-}
-
-/// Returns the process group ID (`PGID`) of the process specified by `pid`.
-pub fn getpgid(pid: i32) -> SysResult<i32> {
-    // SAFETY: `GETPGID` takes a single scalar PID argument.
-    unsafe { syscall1(nr::GETPGID, pid as usize).map(|v| v as i32) }
 }
 
 /// Creates a session and sets the process group ID.
@@ -283,22 +237,6 @@ pub fn setsid() -> SysResult<i32> {
 pub fn umask(mask: u32) -> u32 {
     // SAFETY: `UMASK` takes a scalar mode mask and always succeeds.
     unsafe { syscall1(nr::UMASK, mask as usize).unwrap_or(0) as u32 }
-}
-
-/// Operations on a process or thread (`prctl`).
-///
-/// # Safety
-///
-/// The caller must ensure `arg2..=arg5` satisfy the memory and pointer invariants of `option`.
-pub unsafe fn prctl(
-    option: i32,
-    arg2: usize,
-    arg3: usize,
-    arg4: usize,
-    arg5: usize,
-) -> SysResult<usize> {
-    // SAFETY: Caller upholds the invariants required by `option`.
-    unsafe { syscall5(nr::PRCTL, option as usize, arg2, arg3, arg4, arg5) }
 }
 
 /// Gets resource limits for `resource`.
@@ -457,33 +395,6 @@ pub unsafe fn execve_raw(
     Ok(())
 }
 
-/// Executes a program relative to directory descriptor `dirfd`.
-///
-/// # Safety
-///
-/// `path` must be a valid NUL-terminated C string, and `argv` / `envp` must be valid
-/// null-terminated arrays of NUL-terminated C string pointers.
-pub unsafe fn execveat_raw(
-    dirfd: RawFd,
-    path: *const u8,
-    argv: *const *const u8,
-    envp: *const *const u8,
-    flags: i32,
-) -> SysResult<()> {
-    // SAFETY: Caller guarantees `path`, `argv`, and `envp` are valid C string tables.
-    unsafe {
-        syscall5(
-            nr::EXECVEAT,
-            dirfd as usize,
-            path as usize,
-            argv as usize,
-            envp as usize,
-            flags as usize,
-        )?;
-    }
-    Ok(())
-}
-
 /// Waits for state changes in a child process via `wait4(pid, status, options, null)` with an
 /// optional status out-pointer.
 pub fn waitpid_opt(pid: i32, status: Option<&mut i32>, options: i32) -> SysResult<i32> {
@@ -495,32 +406,6 @@ pub fn waitpid_opt(pid: i32, status: Option<&mut i32>, options: i32) -> SysResul
 /// Waits for state changes in a child process via `wait4(pid, status, options, null)`.
 pub fn waitpid(pid: i32, status: &mut i32, options: i32) -> SysResult<i32> {
     waitpid_opt(pid, Some(status), options)
-}
-
-/// Commits filesystem caches to disk.
-pub fn sync() {
-    // SAFETY: `SYNC` takes no arguments.
-    let _ = unsafe { syscall0(nr::SYNC) };
-}
-
-/// Reboots or halts the system (`reboot` syscall).
-///
-/// # Safety
-///
-/// Invoking `reboot` affects the entire unikernel/system state; if `cmd` reads `arg`,
-/// `arg` must be a valid pointer as required by the kernel.
-pub unsafe fn reboot(magic1: u32, magic2: u32, cmd: u32, arg: usize) -> SysResult<()> {
-    // SAFETY: Caller upholds the invariants of `reboot`.
-    unsafe {
-        syscall4(
-            nr::REBOOT,
-            magic1 as usize,
-            magic2 as usize,
-            cmd as usize,
-            arg,
-        )?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

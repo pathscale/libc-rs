@@ -1,9 +1,8 @@
-//! Pure-Rust futex synchronization primitives (`FutexMutex`, `FutexCondvar`, `FutexOnce`)
-//! with zero `pthreads` dependencies.
+//! Pure-Rust futex synchronization primitives (`FutexMutex`) with zero `pthreads` dependencies.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use crate::raw::{nr, syscall4, syscall6};
@@ -137,7 +136,7 @@ impl<T: ?Sized> FutexMutex<T> {
         }
     }
 
-    /// Acquires the mutex, blocking via futex wait under contention.
+    /// Acquires the mutex, spinning briefly before blocking via futex wait under contention.
     #[must_use]
     pub fn lock(&self) -> FutexMutexGuard<'_, T> {
         if self
@@ -158,16 +157,23 @@ impl<T: ?Sized> FutexMutex<T> {
     #[cold]
     fn lock_contended(&self) {
         let mut c = self.state.load(Ordering::Relaxed);
-        if c == UNLOCKED {
-            match self.state.compare_exchange(
-                UNLOCKED,
-                LOCKED_UNCONTENDED,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(prev) => c = prev,
+        for _ in 0..32 {
+            if c == UNLOCKED {
+                match self.state.compare_exchange(
+                    UNLOCKED,
+                    LOCKED_UNCONTENDED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(prev) => c = prev,
+                }
             }
+            if c != LOCKED_UNCONTENDED {
+                break;
+            }
+            core::hint::spin_loop();
+            c = self.state.load(Ordering::Relaxed);
         }
         loop {
             if c == LOCKED_CONTENDED
@@ -190,7 +196,7 @@ impl<T: ?Sized> FutexMutex<T> {
         }
     }
 
-    /// Releases the mutex without a guard (used by [`FutexCondvar::wait`] and [`FutexMutexGuard`] drop).
+    /// Releases the mutex without a guard (used by [`FutexMutexGuard`] drop).
     ///
     /// # Safety
     ///
@@ -239,133 +245,6 @@ impl<T: ?Sized> Drop for FutexMutexGuard<'_, T> {
     }
 }
 
-/// Move-safe, zero-allocation futex condition variable.
-pub struct FutexCondvar {
-    seq: AtomicU32,
-    waiters: AtomicUsize,
-}
-
-impl Default for FutexCondvar {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FutexCondvar {
-    /// Creates a new [`FutexCondvar`].
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            seq: AtomicU32::new(0),
-            waiters: AtomicUsize::new(0),
-        }
-    }
-
-    /// Atomically releases `guard`, waits for a notification on `self`, and re-locks the mutex.
-    #[must_use]
-    pub fn wait<'a, T: ?Sized>(&self, guard: FutexMutexGuard<'a, T>) -> FutexMutexGuard<'a, T> {
-        let mutex = guard.mutex;
-        self.waiters.fetch_add(1, Ordering::Relaxed);
-        let seq = self.seq.load(Ordering::Acquire);
-        core::mem::forget(guard);
-        // SAFETY: `guard` was forgotten above, transferring ownership of the lock release here.
-        unsafe {
-            mutex.raw_unlock();
-        }
-        futex_wait(&self.seq, seq, None);
-        self.waiters.fetch_sub(1, Ordering::Relaxed);
-        mutex.lock()
-    }
-
-    /// Wakes one waiting thread if any are currently waiting, returning `true` if a waiter was present.
-    pub fn notify_one(&self) -> bool {
-        let had_waiter = self.waiters.load(Ordering::Acquire) > 0;
-        self.seq.fetch_add(1, Ordering::Release);
-        if had_waiter {
-            let _ = futex_wake_one(&self.seq);
-        }
-        had_waiter
-    }
-
-    /// Wakes all waiting threads, returning the observed waiter count.
-    pub fn notify_all(&self) -> usize {
-        let waiting = self.waiters.load(Ordering::Acquire);
-        self.seq.fetch_add(1, Ordering::Release);
-        if waiting > 0 {
-            let _ = futex_wake_all(&self.seq);
-        }
-        waiting
-    }
-}
-
-const ONCE_INCOMPLETE: u32 = 0;
-const ONCE_RUNNING: u32 = 1;
-const ONCE_COMPLETE: u32 = 2;
-
-/// Move-safe, zero-allocation futex one-time initialization primitive.
-pub struct FutexOnce {
-    state: AtomicU32,
-}
-
-impl Default for FutexOnce {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FutexOnce {
-    /// Creates a new uninitialized [`FutexOnce`].
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            state: AtomicU32::new(ONCE_INCOMPLETE),
-        }
-    }
-
-    /// Returns `true` if [`FutexOnce::call_once`] has completed.
-    #[must_use]
-    pub fn is_completed(&self) -> bool {
-        self.state.load(Ordering::Acquire) == ONCE_COMPLETE
-    }
-
-    /// Runs `f` exactly once across all callers.
-    pub fn call_once<F: FnOnce()>(&self, f: F) {
-        if self.state.load(Ordering::Acquire) == ONCE_COMPLETE {
-            return;
-        }
-        let mut f = Some(f);
-        self.call_once_slow(&mut || {
-            if let Some(fun) = f.take() {
-                fun();
-            }
-        });
-    }
-
-    #[cold]
-    fn call_once_slow(&self, f: &mut dyn FnMut()) {
-        loop {
-            match self.state.compare_exchange(
-                ONCE_INCOMPLETE,
-                ONCE_RUNNING,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    f();
-                    self.state.store(ONCE_COMPLETE, Ordering::Release);
-                    let _ = futex_wake_all(&self.state);
-                    return;
-                }
-                Err(ONCE_COMPLETE) => return,
-                Err(ONCE_RUNNING) => {
-                    futex_wait(&self.state, ONCE_RUNNING, None);
-                }
-                Err(_) => unreachable!(),
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,32 +257,9 @@ mod tests {
             assert!(m.try_lock().is_none());
             *g += 5;
         }
-        // Move the mutex by value after locking and unlocking.
         let mut moved = m;
         assert_eq!(*moved.get_mut(), 15);
         *moved.try_lock().unwrap() += 27;
         assert_eq!(moved.into_inner(), 42);
-    }
-
-    #[test]
-    fn futex_condvar_and_once_operate_without_allocation() {
-        let cv = FutexCondvar::new();
-        assert!(!cv.notify_one());
-        assert_eq!(cv.notify_all(), 0);
-
-        let m = FutexMutex::new(1u32);
-        let g = m.lock();
-        // On host builds `futex_wait` returns after a spin_loop hint, allowing single-thread verification
-        // of wait's unlock + relock sequence.
-        let g2 = cv.wait(g);
-        assert_eq!(*g2, 1);
-        drop(g2);
-
-        let once = FutexOnce::new();
-        let mut count = 0usize;
-        once.call_once(|| count += 1);
-        once.call_once(|| count += 10);
-        assert!(once.is_completed());
-        assert_eq!(count, 1);
     }
 }

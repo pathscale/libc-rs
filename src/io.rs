@@ -123,16 +123,6 @@ pub fn pwrite(fd: RawFd, buf: &[u8], offset: i64) -> SysResult<usize> {
     }
 }
 
-/// Reads from `fd` into scatter buffers `iov`.
-///
-/// # Safety
-///
-/// Every [`IoVec`] entry in `iov` must point to valid writable memory for its `iov_len`.
-pub unsafe fn readv(fd: RawFd, iov: &[IoVec]) -> SysResult<usize> {
-    // SAFETY: Caller guarantees each `IoVec` buffer is writable for `iov_len` bytes.
-    unsafe { syscall3(nr::READV, fd as usize, iov.as_ptr() as usize, iov.len()) }
-}
-
 /// Writes gather buffers `iov` to `fd`.
 ///
 /// # Safety
@@ -166,7 +156,7 @@ pub fn dup(fd: RawFd) -> SysResult<RawFd> {
 /// without clearing `FD_CLOEXEC`. Otherwise delegates to `dup3(oldfd, newfd, 0)`.
 pub fn dup2(oldfd: RawFd, newfd: RawFd) -> SysResult<RawFd> {
     if oldfd == newfd {
-        fcntl_getfd(oldfd)?;
+        fcntl(oldfd, F_GETFD, 0)?;
         Ok(newfd)
     } else {
         dup3(oldfd, newfd, 0)
@@ -192,40 +182,6 @@ pub fn fcntl(fd: RawFd, cmd: i32, arg: usize) -> SysResult<i32> {
     // SAFETY: `FCNTL` takes a file descriptor, command code, and argument word.
     let raw = unsafe { syscall3(nr::FCNTL, fd as usize, cmd as u32 as usize, arg)? };
     Ok(raw as i32)
-}
-
-/// Reads file descriptor flags (`F_GETFD`).
-pub fn fcntl_getfd(fd: RawFd) -> SysResult<i32> {
-    fcntl(fd, F_GETFD, 0)
-}
-
-/// Sets file descriptor flags (`F_SETFD`).
-pub fn fcntl_setfd(fd: RawFd, flags: i32) -> SysResult<()> {
-    fcntl(fd, F_SETFD, flags as u32 as usize)?;
-    Ok(())
-}
-
-/// Reads file status flags (`F_GETFL`).
-pub fn fcntl_getfl(fd: RawFd) -> SysResult<i32> {
-    fcntl(fd, F_GETFL, 0)
-}
-
-/// Sets file status flags (`F_SETFL`).
-pub fn fcntl_setfl(fd: RawFd, flags: i32) -> SysResult<()> {
-    fcntl(fd, F_SETFL, flags as u32 as usize)?;
-    Ok(())
-}
-
-/// Duplicates `fd` to a descriptor `>= min_fd` with `FD_CLOEXEC` set (`F_DUPFD_CLOEXEC`).
-pub fn fcntl_dupfd_cloexec(fd: RawFd, min_fd: RawFd) -> SysResult<RawFd> {
-    fcntl(fd, F_DUPFD_CLOEXEC, min_fd as usize)
-}
-
-/// Applies or releases an advisory record lock via `F_SETLK` or `F_SETLKW`.
-pub fn fcntl_setlk(fd: RawFd, lock: &Flock, wait: bool) -> SysResult<()> {
-    let cmd = if wait { F_SETLKW } else { F_SETLK };
-    fcntl(fd, cmd, core::ptr::from_ref(lock) as usize)?;
-    Ok(())
 }
 
 /// Invokes a device control operation (`ioctl`) on `fd`.

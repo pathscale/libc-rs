@@ -1,4 +1,4 @@
-//! Filesystem metadata, path resolution, directory iteration, and mount operations.
+//! Filesystem metadata, path resolution, and directory iteration.
 
 use core::mem::{MaybeUninit, offset_of, size_of};
 
@@ -50,9 +50,6 @@ pub const LOCK_SH: i32 = 1;
 pub const LOCK_EX: i32 = 2;
 pub const LOCK_NB: i32 = 4;
 pub const LOCK_UN: i32 = 8;
-
-pub const MFD_CLOEXEC: u32 = 1;
-pub const MFD_ALLOW_SEALING: u32 = 2;
 
 /// 128-byte AArch64 file metadata structure (`struct stat`).
 #[repr(C)]
@@ -112,19 +109,19 @@ pub fn with_c_path<R>(path: &[u8], f: impl FnOnce(*const u8) -> SysResult<R>) ->
     if path.len() >= PATH_MAX {
         return Err(Errno(ENAMETOOLONG));
     }
+    if path.len() < 256 {
+        let mut buf = [0u8; 256];
+        buf[..path.len()].copy_from_slice(path);
+        return f(buf.as_ptr());
+    }
+    with_c_path_long(path, f)
+}
+
+#[cold]
+fn with_c_path_long<R>(path: &[u8], f: impl FnOnce(*const u8) -> SysResult<R>) -> SysResult<R> {
     let mut buf = [0u8; PATH_MAX];
     buf[..path.len()].copy_from_slice(path);
     f(buf.as_ptr())
-}
-
-fn with_opt_c_path<R>(
-    path: Option<&[u8]>,
-    f: impl FnOnce(*const u8) -> SysResult<R>,
-) -> SysResult<R> {
-    match path {
-        Some(p) => with_c_path(p, f),
-        None => f(core::ptr::null()),
-    }
 }
 
 /// Converts a NUL-terminated C string pointer bounded by [`PATH_MAX`] into a byte slice.
@@ -241,15 +238,6 @@ pub fn fsync(fd: RawFd) -> SysResult<()> {
     Ok(())
 }
 
-/// Synchronizes modified data (and required metadata) of `fd` to storage.
-pub fn fdatasync(fd: RawFd) -> SysResult<()> {
-    // SAFETY: `FDATASYNC` takes a single file descriptor.
-    unsafe {
-        syscall1(nr::FDATASYNC, fd as usize)?;
-    }
-    Ok(())
-}
-
 /// Changes permissions of an open file descriptor `fd`.
 pub fn fchmod(fd: RawFd, mode: u32) -> SysResult<()> {
     // SAFETY: `FCHMOD` takes a file descriptor and mode bits.
@@ -356,24 +344,6 @@ pub fn link(oldpath: &[u8], newpath: &[u8]) -> SysResult<()> {
     linkat(AT_FDCWD, oldpath, AT_FDCWD, newpath, 0)
 }
 
-/// Creates a symbolic link `linkpath` relative to `newdir` pointing to `target`.
-pub fn symlinkat(target: &[u8], newdir: RawFd, linkpath: &[u8]) -> SysResult<()> {
-    with_c_path(target, |c_target| {
-        with_c_path(linkpath, |c_link| {
-            // SAFETY: Both `c_target` and `c_link` are valid NUL-terminated strings.
-            unsafe {
-                syscall3(
-                    nr::SYMLINKAT,
-                    c_target as usize,
-                    newdir as usize,
-                    c_link as usize,
-                )?;
-            }
-            Ok(())
-        })
-    })
-}
-
 /// Reads the target of a symbolic link relative to `dirfd` into `out`.
 pub fn readlinkat<'a>(dirfd: RawFd, path: &[u8], out: &'a mut [u8]) -> SysResult<&'a [u8]> {
     if out.is_empty() {
@@ -455,67 +425,6 @@ pub fn chdir(path: &[u8]) -> SysResult<()> {
             syscall1(nr::CHDIR, c_path as usize)?;
         }
         Ok(())
-    })
-}
-
-/// Changes the root directory of the calling process to `path`.
-pub fn chroot(path: &[u8]) -> SysResult<()> {
-    with_c_path(path, |c_path| {
-        // SAFETY: `c_path` is a valid NUL-terminated path.
-        unsafe {
-            syscall1(nr::CHROOT, c_path as usize)?;
-        }
-        Ok(())
-    })
-}
-
-/// Mounts a filesystem onto `target`.
-pub fn mount(
-    source: Option<&[u8]>,
-    target: &[u8],
-    fstype: Option<&[u8]>,
-    flags: u64,
-    data: Option<&[u8]>,
-) -> SysResult<()> {
-    with_opt_c_path(source, |c_src| {
-        with_c_path(target, |c_target| {
-            with_opt_c_path(fstype, |c_fstype| {
-                with_opt_c_path(data, |c_data| {
-                    // SAFETY: All non-null pointers are valid NUL-terminated buffers.
-                    unsafe {
-                        syscall5(
-                            nr::MOUNT,
-                            c_src as usize,
-                            c_target as usize,
-                            c_fstype as usize,
-                            flags as usize,
-                            c_data as usize,
-                        )?;
-                    }
-                    Ok(())
-                })
-            })
-        })
-    })
-}
-
-/// Unmounts a filesystem mounted at `target`.
-pub fn umount2(target: &[u8], flags: i32) -> SysResult<()> {
-    with_c_path(target, |c_target| {
-        // SAFETY: `c_target` is a valid NUL-terminated path.
-        unsafe {
-            syscall2(nr::UMOUNT2, c_target as usize, flags as u32 as usize)?;
-        }
-        Ok(())
-    })
-}
-
-/// Creates an anonymous in-memory file (`memfd_create`).
-pub fn memfd_create(name: &[u8], flags: u32) -> SysResult<RawFd> {
-    with_c_path(name, |c_name| {
-        // SAFETY: `c_name` is a valid NUL-terminated string.
-        let raw = unsafe { syscall2(nr::MEMFD_CREATE, c_name as usize, flags as usize)? };
-        Ok(raw as RawFd)
     })
 }
 

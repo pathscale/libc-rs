@@ -1,4 +1,4 @@
-//! Socket, UNIX domain, IPv4, and Virtio-Vsock syscall wrappers.
+//! Socket, UNIX domain, and Virtio-Vsock syscall wrappers.
 
 use core::mem::size_of;
 
@@ -8,10 +8,6 @@ use crate::raw::{nr, syscall2, syscall3, syscall4, syscall5, syscall6};
 
 /// Unix domain sockets address family.
 pub const AF_UNIX: i32 = 1;
-/// IPv4 Internet protocols address family.
-pub const AF_INET: i32 = 2;
-/// IPv6 Internet protocols address family.
-pub const AF_INET6: i32 = 10;
 /// Virtio vsock address family.
 pub const AF_VSOCK: i32 = 40;
 
@@ -115,19 +111,8 @@ impl SockAddrVm {
     }
 }
 
-/// Kernel `sockaddr_in` structure for IPv4 sockets.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SockAddrIn {
-    pub sin_family: u16,
-    pub sin_port: u16,
-    pub sin_addr: [u8; 4],
-    pub sin_zero: [u8; 8],
-}
-
 const _: () = {
     assert!(size_of::<SockAddrVm>() == 16);
-    assert!(size_of::<SockAddrIn>() == 16);
 };
 
 /// Creates an endpoint for communication and returns its file descriptor.
@@ -186,18 +171,6 @@ pub fn bind_vsock(fd: RawFd, addr: &SockAddrVm) -> SysResult<()> {
     }
 }
 
-/// Binds an `AF_INET` socket `fd` to `addr`.
-pub fn bind_v4(fd: RawFd, addr: &SockAddrIn) -> SysResult<()> {
-    // SAFETY: `addr` is a valid `SockAddrIn` of size 16 bytes.
-    unsafe {
-        bind_raw(
-            fd,
-            core::ptr::from_ref(addr).cast::<u8>(),
-            size_of::<SockAddrIn>() as u32,
-        )
-    }
-}
-
 /// Connects `fd` to the raw socket address `[addr..addr + addrlen]`.
 ///
 /// # Safety
@@ -226,18 +199,6 @@ pub fn connect_vsock(fd: RawFd, addr: &SockAddrVm) -> SysResult<()> {
             fd,
             core::ptr::from_ref(addr).cast::<u8>(),
             size_of::<SockAddrVm>() as u32,
-        )
-    }
-}
-
-/// Connects an `AF_INET` socket `fd` to `addr`.
-pub fn connect_v4(fd: RawFd, addr: &SockAddrIn) -> SysResult<()> {
-    // SAFETY: `addr` is a valid `SockAddrIn` of size 16 bytes.
-    unsafe {
-        connect_raw(
-            fd,
-            core::ptr::from_ref(addr).cast::<u8>(),
-            size_of::<SockAddrIn>() as u32,
         )
     }
 }
