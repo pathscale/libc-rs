@@ -184,6 +184,16 @@ pub fn fcntl(fd: RawFd, cmd: i32, arg: usize) -> SysResult<i32> {
     Ok(raw as i32)
 }
 
+/// Invokes a raw device control operation (`ioctl`) on `fd`, returning the raw `usize` result.
+///
+/// # Safety
+///
+/// `arg` must satisfy the pointer/type contract of `request`.
+pub unsafe fn ioctl_raw(fd: RawFd, request: u64, arg: usize) -> SysResult<usize> {
+    // SAFETY: Caller guarantees `arg` is valid for `request`.
+    unsafe { syscall3(nr::IOCTL, fd as usize, request as usize, arg) }
+}
+
 /// Invokes a device control operation (`ioctl`) on `fd`.
 ///
 /// # Safety
@@ -191,7 +201,7 @@ pub fn fcntl(fd: RawFd, cmd: i32, arg: usize) -> SysResult<i32> {
 /// `arg` must satisfy the pointer/type contract of `request`.
 pub unsafe fn ioctl(fd: RawFd, request: u64, arg: usize) -> SysResult<i32> {
     // SAFETY: Caller guarantees `arg` is valid for `request`.
-    let raw = unsafe { syscall3(nr::IOCTL, fd as usize, request as usize, arg)? };
+    let raw = unsafe { ioctl_raw(fd, request, arg)? };
     Ok(raw as i32)
 }
 

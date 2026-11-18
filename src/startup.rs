@@ -447,6 +447,7 @@ pub fn environ_vec() -> Vec<Vec<u8>> {
 macro_rules! process_entry {
     ($main_fn:path) => {
         #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+        #[allow(unsafe_code)]
         #[unsafe(naked)]
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn _start() -> ! {
@@ -454,6 +455,7 @@ macro_rules! process_entry {
         }
 
         #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+        #[allow(unsafe_code)]
         #[unsafe(no_mangle)]
         extern "C" fn _libc_rs_start_rust(sp: *const u64) -> ! {
             // SAFETY: `sp` is the initial EL0 stack pointer passed from `_start`.
@@ -465,6 +467,7 @@ macro_rules! process_entry {
         }
 
         #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+        #[allow(unsafe_code)]
         #[panic_handler]
         fn _libc_rs_process_panic(_info: &core::panic::PanicInfo) -> ! {
             $crate::process::abort()

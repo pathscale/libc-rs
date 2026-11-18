@@ -17,9 +17,12 @@ pub mod nr {
     pub const UNLINKAT: usize = 35;
     pub const LINKAT: usize = 37;
     pub const RENAMEAT: usize = 38;
+    pub const UMOUNT2: usize = 39;
+    pub const MOUNT: usize = 40;
     pub const FTRUNCATE: usize = 46;
     pub const FACCESSAT: usize = 48;
     pub const CHDIR: usize = 49;
+    pub const CHROOT: usize = 51;
     pub const FCHMOD: usize = 52;
     pub const OPENAT: usize = 56;
     pub const CLOSE: usize = 57;
@@ -35,6 +38,7 @@ pub mod nr {
     pub const READLINKAT: usize = 78;
     pub const NEWFSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
+    pub const SYNC: usize = 81;
     pub const FSYNC: usize = 82;
     pub const EXIT: usize = 93;
     pub const EXIT_GROUP: usize = 94;
@@ -63,6 +67,8 @@ pub mod nr {
     pub const BIND: usize = 200;
     pub const LISTEN: usize = 201;
     pub const CONNECT: usize = 203;
+    pub const GETSOCKNAME: usize = 204;
+    pub const GETPEERNAME: usize = 205;
     pub const SENDTO: usize = 206;
     pub const RECVFROM: usize = 207;
     pub const SETSOCKOPT: usize = 208;

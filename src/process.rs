@@ -1,8 +1,12 @@
 //! Process lifecycle, credentials, signals, resource limits, and wait syscalls.
 
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
 use core::mem::size_of;
 
 use crate::errno::SysResult;
+#[cfg(feature = "alloc")]
+use crate::errno::{EINVAL, Errno};
 use crate::raw::{nr, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5};
 use crate::time::Timeval;
 
@@ -377,6 +381,71 @@ pub unsafe fn execve_raw(
         syscall3(nr::EXECVE, prog as usize, argv as usize, envp as usize)?;
     }
     Ok(())
+}
+
+#[cfg(feature = "alloc")]
+fn to_cstring_bytes(s: &[u8]) -> SysResult<Vec<u8>> {
+    if let Some((&last, prefix)) = s.split_last() {
+        if last == 0 {
+            if prefix.contains(&0) {
+                return Err(Errno(EINVAL));
+            }
+            let mut v = Vec::with_capacity(s.len());
+            v.extend_from_slice(s);
+            return Ok(v);
+        }
+    }
+    if s.contains(&0) {
+        return Err(Errno(EINVAL));
+    }
+    let mut v = Vec::with_capacity(s.len() + 1);
+    v.extend_from_slice(s);
+    v.push(0);
+    Ok(v)
+}
+
+/// Replaces the current process image with `path`, passing `args` (`argv`) and `envs` (`envp`).
+///
+/// Returns `Err(Errno(EINVAL))` if `path` is empty or any slice contains an interior NUL byte.
+#[cfg(feature = "alloc")]
+pub fn execve_bytes(
+    path: &[u8],
+    args: &[&[u8]],
+    envs: &[&[u8]],
+) -> SysResult<core::convert::Infallible> {
+    let c_path = to_cstring_bytes(path)?;
+    if c_path.len() <= 1 {
+        return Err(Errno(EINVAL));
+    }
+
+    let mut c_args: Vec<Vec<u8>> = Vec::with_capacity(args.len());
+    for &arg in args {
+        c_args.push(to_cstring_bytes(arg)?);
+    }
+
+    let mut c_envs: Vec<Vec<u8>> = Vec::with_capacity(envs.len());
+    for &env in envs {
+        c_envs.push(to_cstring_bytes(env)?);
+    }
+
+    let mut argv_ptrs: Vec<*const u8> = Vec::with_capacity(c_args.len() + 1);
+    for arg in &c_args {
+        argv_ptrs.push(arg.as_ptr());
+    }
+    argv_ptrs.push(core::ptr::null());
+
+    let mut envp_ptrs: Vec<*const u8> = Vec::with_capacity(c_envs.len() + 1);
+    for env in &c_envs {
+        envp_ptrs.push(env.as_ptr());
+    }
+    envp_ptrs.push(core::ptr::null());
+
+    // SAFETY: `c_path`, `argv_ptrs`, and `envp_ptrs` remain live across the syscall and
+    // contain valid NUL-terminated strings and null-terminated pointer vectors.
+    unsafe {
+        execve_raw(c_path.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr())?;
+    }
+    Err(Errno(EINVAL))
 }
 
 /// Waits for state changes in a child process via `wait4(pid, status, options, null)` with an

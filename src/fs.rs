@@ -4,7 +4,7 @@ use core::mem::{MaybeUninit, offset_of, size_of};
 
 use crate::errno::{EINVAL, ENAMETOOLONG, Errno, SysResult};
 use crate::fd::{AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, RawFd};
-use crate::raw::{nr, syscall1, syscall2, syscall3, syscall4, syscall5};
+use crate::raw::{nr, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5};
 
 pub const PATH_MAX: usize = 4096;
 
@@ -50,6 +50,22 @@ pub const LOCK_SH: i32 = 1;
 pub const LOCK_EX: i32 = 2;
 pub const LOCK_NB: i32 = 4;
 pub const LOCK_UN: i32 = 8;
+
+pub const MS_RDONLY: u64 = 1;
+pub const MS_NOSUID: u64 = 2;
+pub const MS_NODEV: u64 = 4;
+pub const MS_NOEXEC: u64 = 8;
+pub const MS_SYNCHRONOUS: u64 = 16;
+pub const MS_REMOUNT: u64 = 32;
+pub const MS_NOATIME: u64 = 1024;
+pub const MS_BIND: u64 = 4096;
+pub const MS_MOVE: u64 = 8192;
+pub const MS_REC: u64 = 16384;
+
+pub const MNT_FORCE: i32 = 1;
+pub const MNT_DETACH: i32 = 2;
+pub const MNT_EXPIRE: i32 = 4;
+pub const UMOUNT_NOFOLLOW: i32 = 8;
 
 /// 128-byte AArch64 file metadata structure (`struct stat`).
 #[repr(C)]
@@ -426,6 +442,74 @@ pub fn chdir(path: &[u8]) -> SysResult<()> {
         }
         Ok(())
     })
+}
+
+fn with_opt_c_path<R>(
+    opt_path: Option<&[u8]>,
+    f: impl FnOnce(*const u8) -> SysResult<R>,
+) -> SysResult<R> {
+    match opt_path {
+        Some(path) => with_c_path(path, f),
+        None => f(core::ptr::null()),
+    }
+}
+
+/// Mounts a filesystem at `target`.
+pub fn mount(
+    source: Option<&[u8]>,
+    target: &[u8],
+    fstype: Option<&[u8]>,
+    flags: u64,
+    data: Option<&[u8]>,
+) -> SysResult<()> {
+    with_opt_c_path(source, |c_src| {
+        with_c_path(target, |c_target| {
+            with_opt_c_path(fstype, |c_fstype| {
+                with_opt_c_path(data, |c_data| {
+                    // SAFETY: All non-null pointers are valid NUL-terminated stack/caller buffers.
+                    unsafe {
+                        syscall5(
+                            nr::MOUNT,
+                            c_src as usize,
+                            c_target as usize,
+                            c_fstype as usize,
+                            flags as usize,
+                            c_data as usize,
+                        )?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+    })
+}
+
+/// Unmounts the filesystem mounted at `target` with `flags` (`MNT_FORCE`, `MNT_DETACH`, etc.).
+pub fn umount2(target: &[u8], flags: i32) -> SysResult<()> {
+    with_c_path(target, |c_target| {
+        // SAFETY: `c_target` is a valid NUL-terminated path.
+        unsafe {
+            syscall2(nr::UMOUNT2, c_target as usize, flags as u32 as usize)?;
+        }
+        Ok(())
+    })
+}
+
+/// Changes the root directory of the calling process to `path`.
+pub fn chroot(path: &[u8]) -> SysResult<()> {
+    with_c_path(path, |c_path| {
+        // SAFETY: `c_path` is a valid NUL-terminated path.
+        unsafe {
+            syscall1(nr::CHROOT, c_path as usize)?;
+        }
+        Ok(())
+    })
+}
+
+/// Commits all filesystem caches to disk (`sync`).
+pub fn sync_all_filesystems() {
+    // SAFETY: `SYNC` takes no arguments and always succeeds.
+    let _ = unsafe { syscall0(nr::SYNC) };
 }
 
 /// Reads raw `linux_dirent64` entries from directory `fd` into `buf`.
