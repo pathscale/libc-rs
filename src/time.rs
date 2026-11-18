@@ -1,6 +1,8 @@
 //! Clocks, timestamps, and high-resolution sleep syscalls.
 
 use core::mem::size_of;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::errno::SysResult;
 use crate::raw::{nr, syscall2, syscall4};
@@ -33,8 +35,8 @@ const _: () = {
     assert!(size_of::<Timeval>() == 16);
 };
 
-/// Queries the current value of `clock_id`.
-pub fn clock_gettime(clock_id: i32) -> SysResult<Timespec> {
+/// Queries the current value of `clock_id` via the `CLOCK_GETTIME` syscall.
+pub fn clock_gettime_syscall(clock_id: i32) -> SysResult<Timespec> {
     let mut ts = Timespec::default();
     // SAFETY: `ts` is a valid, aligned stack `Timespec` for the kernel to write into.
     unsafe {
@@ -45,6 +47,43 @@ pub fn clock_gettime(clock_id: i32) -> SysResult<Timespec> {
         )?;
     }
     Ok(ts)
+}
+
+/// Queries the current value of `clock_id`.
+pub fn clock_gettime(clock_id: i32) -> SysResult<Timespec> {
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    if clock_id == CLOCK_MONOTONIC {
+        static CACHED_HZ: AtomicU64 = AtomicU64::new(0);
+        let mut hz = CACHED_HZ.load(Ordering::Relaxed);
+        if hz == 0 {
+            // SAFETY: `cntfrq_el0` is readable from EL0 when `CNTKCTL_EL1.EL0VCTEN == 1`.
+            unsafe {
+                core::arch::asm!(
+                    "mrs {}, cntfrq_el0",
+                    out(reg) hz,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            if hz != 0 {
+                CACHED_HZ.store(hz, Ordering::Relaxed);
+            }
+        }
+        if hz != 0 {
+            let ticks: u64;
+            // SAFETY: `cntvct_el0` is readable from EL0 when `CNTKCTL_EL1.EL0VCTEN == 1`.
+            unsafe {
+                core::arch::asm!(
+                    "mrs {}, cntvct_el0",
+                    out(reg) ticks,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            let tv_sec = (ticks / hz) as i64;
+            let tv_nsec = (((ticks % hz) as u128 * 1_000_000_000) / (hz as u128)) as i64;
+            return Ok(Timespec { tv_sec, tv_nsec });
+        }
+    }
+    clock_gettime_syscall(clock_id)
 }
 
 /// Sets the time of `clock_id` to `ts`.

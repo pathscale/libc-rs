@@ -1,6 +1,8 @@
 //! Dynamic `mmap_anonymous` slab and page-granularity allocator for unikernel EL0 binaries.
 
+use core::cell::UnsafeCell;
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::FutexMutex;
 
@@ -19,6 +21,7 @@ const fn align_up(value: usize, align: usize) -> Option<usize> {
 }
 
 const MMAP_NUM_CLASSES: usize = 8;
+const _: () = assert!(MMAP_NUM_CLASSES == 8);
 const MMAP_CLASS_TOTAL_SIZES: [usize; MMAP_NUM_CLASSES] = [32, 64, 128, 256, 512, 1024, 2048, 4096];
 const MMAP_HEADER_BYTES: usize = 16;
 const MMAP_LARGE_HEADER_BYTES: usize = 32;
@@ -28,6 +31,50 @@ const MMAP_SLAB_BYTES: usize = 16 * crate::mm::PAGE_SIZE;
 const SMALL_MAGIC_BASE: usize = 0xC0DE_5A1B_0000_0000;
 const SMALL_MAGIC_MASK: usize = 0xFFFF_FFFF_FFFF_FF00;
 const LARGE_MAGIC: usize = 0xC0DE_1A6E_5A1B_0001;
+
+const MAGAZINE_SLOTS: usize = 64;
+const MAGAZINE_CAP: usize = 16;
+const MAGAZINE_BATCH: usize = 8;
+
+#[derive(Copy, Clone)]
+struct ClassMagazine {
+    len: usize,
+    ptrs: [*mut u8; MAGAZINE_CAP],
+}
+
+impl ClassMagazine {
+    const fn new() -> Self {
+        Self {
+            len: 0,
+            ptrs: [null_mut(); MAGAZINE_CAP],
+        }
+    }
+}
+
+#[repr(align(64))]
+struct ThreadMagazineSlot {
+    in_use: AtomicBool,
+    classes: UnsafeCell<[ClassMagazine; MMAP_NUM_CLASSES]>,
+}
+
+// SAFETY: Access to `classes` is serialized per slot via `in_use` acquire/release compare-exchange.
+unsafe impl Sync for ThreadMagazineSlot {}
+
+impl ThreadMagazineSlot {
+    const fn new() -> Self {
+        Self {
+            in_use: AtomicBool::new(false),
+            classes: UnsafeCell::new([ClassMagazine::new(); MMAP_NUM_CLASSES]),
+        }
+    }
+}
+
+#[inline]
+fn current_magazine_slot_index() -> usize {
+    let tid = crate::thread::current_thread_id();
+    let mixed = tid ^ (tid >> 6) ^ (tid >> 12) ^ (tid >> 19);
+    (mixed as usize) & (MAGAZINE_SLOTS - 1)
+}
 
 #[inline]
 const fn mmap_small_class_index(size: usize) -> Option<usize> {
@@ -46,7 +93,7 @@ const fn mmap_small_class_index(size: usize) -> Option<usize> {
 }
 
 struct MmapHeapInner {
-    free_lists: [*mut FreeNode; MMAP_NUM_CLASSES],
+    free_lists: [*mut FreeNode; 8],
     slab_ptr: *mut u8,
     slab_rem: usize,
 }
@@ -57,7 +104,16 @@ unsafe impl Send for MmapHeapInner {}
 impl MmapHeapInner {
     const fn new() -> Self {
         Self {
-            free_lists: [null_mut(); MMAP_NUM_CLASSES],
+            free_lists: [
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            ],
             slab_ptr: null_mut(),
             slab_rem: 0,
         }
@@ -117,6 +173,8 @@ impl MmapHeapInner {
 /// large or over-aligned allocations.
 pub struct MmapHeap {
     inner: FutexMutex<MmapHeapInner>,
+    use_tls_cache: bool,
+    magazines: [ThreadMagazineSlot; MAGAZINE_SLOTS],
 }
 
 impl Default for MmapHeap {
@@ -126,12 +184,106 @@ impl Default for MmapHeap {
 }
 
 impl MmapHeap {
-    /// Creates a new uninitialized [`MmapHeap`].
+    /// Creates a new uninitialized [`MmapHeap`] without the per-thread magazine cache.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             inner: FutexMutex::new(MmapHeapInner::new()),
+            use_tls_cache: false,
+            magazines: [const { ThreadMagazineSlot::new() }; MAGAZINE_SLOTS],
         }
+    }
+
+    /// Creates a new uninitialized [`MmapHeap`] with the lock-free per-thread small-block magazine cache enabled.
+    #[must_use]
+    pub const fn new_cached() -> Self {
+        Self {
+            inner: FutexMutex::new(MmapHeapInner::new()),
+            use_tls_cache: true,
+            magazines: [const { ThreadMagazineSlot::new() }; MAGAZINE_SLOTS],
+        }
+    }
+
+    #[inline]
+    unsafe fn alloc_small_cached(&self, class_idx: usize) -> *mut u8 {
+        let slot = &self.magazines[current_magazine_slot_index()];
+        if slot
+            .in_use
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            // SAFETY: `slot.in_use` is exclusively held by the current thread.
+            let mag = unsafe { &mut (*slot.classes.get())[class_idx] };
+            if mag.len > 0 {
+                mag.len -= 1;
+                let ptr = mag.ptrs[mag.len];
+                slot.in_use.store(false, Ordering::Release);
+                return ptr;
+            }
+
+            let mut inner = self.inner.lock();
+            // SAFETY: `class_idx` is a valid small class index.
+            let first = unsafe { inner.alloc_small(class_idx) };
+            if !first.is_null() {
+                let mut i = 1;
+                while i < MAGAZINE_BATCH && mag.len < MAGAZINE_CAP {
+                    // SAFETY: `class_idx` is a valid small class index.
+                    let extra = unsafe { inner.alloc_small(class_idx) };
+                    if extra.is_null() {
+                        break;
+                    }
+                    mag.ptrs[mag.len] = extra;
+                    mag.len += 1;
+                    i += 1;
+                }
+            }
+            drop(inner);
+            slot.in_use.store(false, Ordering::Release);
+            return first;
+        }
+
+        let mut inner = self.inner.lock();
+        // SAFETY: `class_idx` is a valid small class index.
+        unsafe { inner.alloc_small(class_idx) }
+    }
+
+    #[inline]
+    unsafe fn free_small_cached(&self, ptr: *mut u8, block_ptr: *mut u8, class_idx: usize) {
+        let slot = &self.magazines[current_magazine_slot_index()];
+        if slot
+            .in_use
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            // SAFETY: `slot.in_use` is exclusively held by the current thread.
+            let mag = unsafe { &mut (*slot.classes.get())[class_idx] };
+            if mag.len < MAGAZINE_CAP {
+                mag.ptrs[mag.len] = ptr;
+                mag.len += 1;
+                slot.in_use.store(false, Ordering::Release);
+                return;
+            }
+
+            let mut inner = self.inner.lock();
+            let mut spilled = 0;
+            while spilled < MAGAZINE_BATCH && mag.len > 0 {
+                mag.len -= 1;
+                let victim_ptr = mag.ptrs[mag.len];
+                // SAFETY: `victim_ptr` is a small user pointer preceded by `MMAP_HEADER_BYTES`.
+                let victim_block = unsafe { victim_ptr.sub(MMAP_HEADER_BYTES) };
+                unsafe { inner.free_small(victim_block, class_idx) };
+                spilled += 1;
+            }
+            drop(inner);
+            mag.ptrs[mag.len] = ptr;
+            mag.len += 1;
+            slot.in_use.store(false, Ordering::Release);
+            return;
+        }
+
+        let mut inner = self.inner.lock();
+        // SAFETY: `block_ptr` is a small slab block for `class_idx`.
+        unsafe { inner.free_small(block_ptr, class_idx) };
     }
 
     /// Allocates `size` bytes with alignment `align` (at least 16-byte aligned), recording
@@ -149,6 +301,10 @@ impl MmapHeap {
 
         if eff_align == 16 && req_size <= MMAP_MAX_SMALL_PAYLOAD {
             if let Some(class_idx) = mmap_small_class_index(req_size) {
+                if self.use_tls_cache {
+                    // SAFETY: `class_idx` is a valid small class index.
+                    return unsafe { self.alloc_small_cached(class_idx) };
+                }
                 let mut inner = self.inner.lock();
                 // SAFETY: `class_idx` is a valid small class index.
                 return unsafe { inner.alloc_small(class_idx) };
@@ -257,6 +413,11 @@ impl MmapHeap {
             let class_idx = magic & 0xFF;
             if class_idx < MMAP_NUM_CLASSES {
                 let block_ptr = hdr.cast::<u8>();
+                if self.use_tls_cache {
+                    // SAFETY: `ptr` and `block_ptr` belong to small slab class `class_idx`.
+                    unsafe { self.free_small_cached(ptr, block_ptr, class_idx) };
+                    return;
+                }
                 let mut inner = self.inner.lock();
                 // SAFETY: `block_ptr` is a small slab block for `class_idx`.
                 unsafe { inner.free_small(block_ptr, class_idx) };
@@ -407,7 +568,7 @@ unsafe impl core::alloc::GlobalAlloc for MmapHeap {
 
 /// Process-wide global [`MmapHeap`] instance used by `c_malloc`, `c_calloc`, `c_realloc`,
 /// `c_free`, and `c_posix_memalign`.
-pub static GLOBAL_MMAP_HEAP: MmapHeap = MmapHeap::new();
+pub static GLOBAL_MMAP_HEAP: MmapHeap = MmapHeap::new_cached();
 
 /// Allocates `size` bytes of 16-byte aligned memory from [`GLOBAL_MMAP_HEAP`].
 ///
@@ -568,6 +729,117 @@ mod tests {
                     c_free(aligned_out);
                 }
                 assert_eq!(MUNMAP_COUNT.load(Ordering::SeqCst), 2);
+            },
+        );
+    }
+
+    #[test]
+    fn mmap_heap_magazine_hit_refill_and_spill_all_classes() {
+        use crate::errno::{ENOMEM, Errno};
+        use crate::raw::{nr, with_mock_syscall};
+
+        #[repr(align(4096))]
+        struct AlignedArena([u8; 512 * 1024]);
+
+        static mut ARENA: AlignedArena = AlignedArena([0; 512 * 1024]);
+        static OFFSET: AtomicUsize = AtomicUsize::new(0);
+
+        OFFSET.store(0, Ordering::SeqCst);
+
+        with_mock_syscall(
+            |sysno, args| match sysno {
+                nr::MMAP => {
+                    let len = args[1];
+                    let aligned_len = (len + 4095) & !4095;
+                    let start = OFFSET.fetch_add(aligned_len, Ordering::SeqCst);
+                    if start + aligned_len > 512 * 1024 {
+                        return Err(Errno(ENOMEM));
+                    }
+                    // SAFETY: `start + aligned_len` is within `ARENA`.
+                    let ptr = unsafe { core::ptr::addr_of_mut!(ARENA.0).cast::<u8>().add(start) };
+                    unsafe {
+                        crate::mem::set_bytes(ptr, 0, aligned_len);
+                    }
+                    Ok(ptr as usize)
+                }
+                nr::MUNMAP => Ok(0),
+                _ => Err(Errno(crate::errno::ENOSYS)),
+            },
+            || {
+                let heap = MmapHeap::new_cached();
+                let uncached = MmapHeap::new();
+                assert!(heap.use_tls_cache);
+                assert!(!uncached.use_tls_cache);
+                let slot_idx = current_magazine_slot_index();
+
+                for (class_idx, &total_bytes) in MMAP_CLASS_TOTAL_SIZES.iter().enumerate() {
+                    let payload = total_bytes - MMAP_HEADER_BYTES;
+                    let mut allocated = [null_mut::<u8>(); 20];
+
+                    // First allocation triggers a batch refill of 8 blocks (1 returned + 7 cached).
+                    allocated[0] = unsafe { heap.alloc_c(payload, 16) };
+                    assert!(!allocated[0].is_null());
+                    let mag_len_after_first =
+                        unsafe { (*heap.magazines[slot_idx].classes.get())[class_idx].len };
+                    assert_eq!(mag_len_after_first, MAGAZINE_BATCH - 1);
+
+                    // Allocate 19 more blocks across a second and third refill batch.
+                    for i in 1..20 {
+                        let p = unsafe { heap.alloc_c(payload, 16) };
+                        assert!(!p.is_null());
+                        assert_eq!((p as usize) % 16, 0);
+                        unsafe {
+                            crate::mem::set_bytes(p, (class_idx as u8).wrapping_add(i as u8), payload);
+                        }
+                        allocated[i] = p;
+                    }
+
+                    // Drain any remaining cached blocks in this class so we test exact fill and spill.
+                    loop {
+                        let cur_len =
+                            unsafe { (*heap.magazines[slot_idx].classes.get())[class_idx].len };
+                        if cur_len == 0 {
+                            break;
+                        }
+                        let extra = unsafe { heap.alloc_c(payload, 16) };
+                        assert!(!extra.is_null());
+                    }
+
+                    // Free 16 blocks to fill the magazine to MAGAZINE_CAP (16).
+                    for i in 0..MAGAZINE_CAP {
+                        unsafe { heap.free_c(allocated[i]) };
+                    }
+                    let mag_len_full =
+                        unsafe { (*heap.magazines[slot_idx].classes.get())[class_idx].len };
+                    assert_eq!(mag_len_full, MAGAZINE_CAP);
+
+                    // Freeing the 17th block spills MAGAZINE_BATCH (8) blocks to MmapHeapInner
+                    // and pushes the new block, leaving `MAGAZINE_CAP - MAGAZINE_BATCH + 1 == 9`.
+                    unsafe { heap.free_c(allocated[MAGAZINE_CAP]) };
+                    let mag_len_after_spill =
+                        unsafe { (*heap.magazines[slot_idx].classes.get())[class_idx].len };
+                    assert_eq!(mag_len_after_spill, MAGAZINE_CAP - MAGAZINE_BATCH + 1);
+
+                    // LIFO magazine hit returns the most recently freed block without touching inner.
+                    let hit = unsafe { heap.alloc_c(payload, 16) };
+                    assert_eq!(hit, allocated[MAGAZINE_CAP]);
+
+                    // Verify calloc_c and realloc_c work seamlessly with the magazine cache.
+                    let zeroed = unsafe { heap.calloc_c(1, payload) };
+                    assert!(!zeroed.is_null());
+                    for b in 0..payload {
+                        assert_eq!(unsafe { *zeroed.add(b) }, 0);
+                    }
+                    let shrunk = unsafe { heap.realloc_c(zeroed, 8) };
+                    assert!(!shrunk.is_null());
+                    unsafe {
+                        heap.free_c(shrunk);
+                        heap.free_c(hit);
+                    }
+                    for i in (MAGAZINE_CAP + 1)..20 {
+                        unsafe { heap.free_c(allocated[i]) };
+                    }
+                }
             },
         );
     }
