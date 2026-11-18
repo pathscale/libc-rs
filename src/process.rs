@@ -165,15 +165,10 @@ pub fn exit_group(code: i32) -> ! {
 
 /// Immediately traps/aborts execution without unwinding.
 pub fn abort() -> ! {
-    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-    // SAFETY: `brk #0` triggers an immediate hardware trap in EL0.
-    unsafe {
-        core::arch::asm!("brk #0", options(noreturn, nostack, nomem));
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
-    loop {
-        core::hint::spin_loop();
-    }
+    let _ = kill(getpid(), SIGABRT);
+    // SAFETY: `EXIT_GROUP` terminates all threads in the calling process.
+    let _ = unsafe { syscall1(nr::EXIT_GROUP, 134) };
+    crate::raw::trap_abort()
 }
 
 /// Returns the process ID (`PID`) of the calling process.
@@ -320,17 +315,6 @@ pub unsafe fn rt_sigaction_raw(
     Ok(())
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "none"))]
-#[unsafe(naked)]
-unsafe extern "C" fn default_sigrestorer() -> ! {
-    core::arch::naked_asm!(
-        "mov x8, #{nr_sigreturn}",
-        "svc #0",
-        "brk #0",
-        nr_sigreturn = const nr::RT_SIGRETURN,
-    );
-}
-
 /// Examines and changes a signal action using typed [`KernelSigAction`] structures.
 ///
 /// # Safety
@@ -350,7 +334,7 @@ pub unsafe fn sigaction(
                 tmp.sa_flags |= SA_RESTORER;
                 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
                 {
-                    tmp.sa_restorer = default_sigrestorer as *const () as usize;
+                    tmp.sa_restorer = crate::raw::default_sigrestorer as *const () as usize;
                 }
                 #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
                 {

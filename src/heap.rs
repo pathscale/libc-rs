@@ -35,18 +35,22 @@ const LARGE_MAGIC: usize = 0xC0DE_1A6E_5A1B_0001;
 const MAGAZINE_SLOTS: usize = 64;
 const MAGAZINE_CAP: usize = 16;
 const MAGAZINE_BATCH: usize = 8;
+const _: () = {
+    assert!(MAGAZINE_SLOTS == 64);
+    assert!(MAGAZINE_CAP == 16);
+};
 
 #[derive(Copy, Clone)]
 struct ClassMagazine {
     len: usize,
-    ptrs: [*mut u8; MAGAZINE_CAP],
+    ptrs: [*mut u8; 16],
 }
 
 impl ClassMagazine {
     const fn new() -> Self {
         Self {
             len: 0,
-            ptrs: [null_mut(); MAGAZINE_CAP],
+            ptrs: [null_mut(); 16],
         }
     }
 }
@@ -54,7 +58,7 @@ impl ClassMagazine {
 #[repr(align(64))]
 struct ThreadMagazineSlot {
     in_use: AtomicBool,
-    classes: UnsafeCell<[ClassMagazine; MMAP_NUM_CLASSES]>,
+    classes: UnsafeCell<[ClassMagazine; 8]>,
 }
 
 // SAFETY: Access to `classes` is serialized per slot via `in_use` acquire/release compare-exchange.
@@ -64,7 +68,7 @@ impl ThreadMagazineSlot {
     const fn new() -> Self {
         Self {
             in_use: AtomicBool::new(false),
-            classes: UnsafeCell::new([ClassMagazine::new(); MMAP_NUM_CLASSES]),
+            classes: UnsafeCell::new([ClassMagazine::new(); 8]),
         }
     }
 }
@@ -168,13 +172,14 @@ impl MmapHeapInner {
     }
 }
 
+static GLOBAL_MAGAZINES: [ThreadMagazineSlot; 64] = [const { ThreadMagazineSlot::new() }; 64];
+
 /// Dynamic virtual-memory allocator backed by `mmap_anonymous` slabs for small blocks
 /// (`<= 4080` bytes) and direct page-granularity `mmap_anonymous`/`munmap` mappings for
 /// large or over-aligned allocations.
 pub struct MmapHeap {
     inner: FutexMutex<MmapHeapInner>,
     use_tls_cache: bool,
-    magazines: [ThreadMagazineSlot; MAGAZINE_SLOTS],
 }
 
 impl Default for MmapHeap {
@@ -190,7 +195,6 @@ impl MmapHeap {
         Self {
             inner: FutexMutex::new(MmapHeapInner::new()),
             use_tls_cache: false,
-            magazines: [const { ThreadMagazineSlot::new() }; MAGAZINE_SLOTS],
         }
     }
 
@@ -200,13 +204,12 @@ impl MmapHeap {
         Self {
             inner: FutexMutex::new(MmapHeapInner::new()),
             use_tls_cache: true,
-            magazines: [const { ThreadMagazineSlot::new() }; MAGAZINE_SLOTS],
         }
     }
 
     #[inline]
     unsafe fn alloc_small_cached(&self, class_idx: usize) -> *mut u8 {
-        let slot = &self.magazines[current_magazine_slot_index()];
+        let slot = &GLOBAL_MAGAZINES[current_magazine_slot_index()];
         if slot
             .in_use
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -249,7 +252,7 @@ impl MmapHeap {
 
     #[inline]
     unsafe fn free_small_cached(&self, ptr: *mut u8, block_ptr: *mut u8, class_idx: usize) {
-        let slot = &self.magazines[current_magazine_slot_index()];
+        let slot = &GLOBAL_MAGAZINES[current_magazine_slot_index()];
         if slot
             .in_use
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -771,6 +774,9 @@ mod tests {
                 assert!(heap.use_tls_cache);
                 assert!(!uncached.use_tls_cache);
                 let slot_idx = current_magazine_slot_index();
+                unsafe {
+                    *GLOBAL_MAGAZINES[slot_idx].classes.get() = [ClassMagazine::new(); 8];
+                }
 
                 for (class_idx, &total_bytes) in MMAP_CLASS_TOTAL_SIZES.iter().enumerate() {
                     let payload = total_bytes - MMAP_HEADER_BYTES;
@@ -780,24 +786,28 @@ mod tests {
                     allocated[0] = unsafe { heap.alloc_c(payload, 16) };
                     assert!(!allocated[0].is_null());
                     let mag_len_after_first =
-                        unsafe { (*heap.magazines[slot_idx].classes.get())[class_idx].len };
+                        unsafe { (*GLOBAL_MAGAZINES[slot_idx].classes.get())[class_idx].len };
                     assert_eq!(mag_len_after_first, MAGAZINE_BATCH - 1);
 
                     // Allocate 19 more blocks across a second and third refill batch.
-                    for i in 1..20 {
+                    for (i, slot_ptr) in allocated.iter_mut().enumerate().skip(1) {
                         let p = unsafe { heap.alloc_c(payload, 16) };
                         assert!(!p.is_null());
                         assert_eq!((p as usize) % 16, 0);
                         unsafe {
-                            crate::mem::set_bytes(p, (class_idx as u8).wrapping_add(i as u8), payload);
+                            crate::mem::set_bytes(
+                                p,
+                                (class_idx as u8).wrapping_add(i as u8),
+                                payload,
+                            );
                         }
-                        allocated[i] = p;
+                        *slot_ptr = p;
                     }
 
                     // Drain any remaining cached blocks in this class so we test exact fill and spill.
                     loop {
                         let cur_len =
-                            unsafe { (*heap.magazines[slot_idx].classes.get())[class_idx].len };
+                            unsafe { (*GLOBAL_MAGAZINES[slot_idx].classes.get())[class_idx].len };
                         if cur_len == 0 {
                             break;
                         }
@@ -806,18 +816,18 @@ mod tests {
                     }
 
                     // Free 16 blocks to fill the magazine to MAGAZINE_CAP (16).
-                    for i in 0..MAGAZINE_CAP {
-                        unsafe { heap.free_c(allocated[i]) };
+                    for &ptr in allocated.iter().take(MAGAZINE_CAP) {
+                        unsafe { heap.free_c(ptr) };
                     }
                     let mag_len_full =
-                        unsafe { (*heap.magazines[slot_idx].classes.get())[class_idx].len };
+                        unsafe { (*GLOBAL_MAGAZINES[slot_idx].classes.get())[class_idx].len };
                     assert_eq!(mag_len_full, MAGAZINE_CAP);
 
                     // Freeing the 17th block spills MAGAZINE_BATCH (8) blocks to MmapHeapInner
                     // and pushes the new block, leaving `MAGAZINE_CAP - MAGAZINE_BATCH + 1 == 9`.
                     unsafe { heap.free_c(allocated[MAGAZINE_CAP]) };
                     let mag_len_after_spill =
-                        unsafe { (*heap.magazines[slot_idx].classes.get())[class_idx].len };
+                        unsafe { (*GLOBAL_MAGAZINES[slot_idx].classes.get())[class_idx].len };
                     assert_eq!(mag_len_after_spill, MAGAZINE_CAP - MAGAZINE_BATCH + 1);
 
                     // LIFO magazine hit returns the most recently freed block without touching inner.
@@ -836,8 +846,8 @@ mod tests {
                         heap.free_c(shrunk);
                         heap.free_c(hit);
                     }
-                    for i in (MAGAZINE_CAP + 1)..20 {
-                        unsafe { heap.free_c(allocated[i]) };
+                    for &ptr in allocated.iter().skip(MAGAZINE_CAP + 1) {
+                        unsafe { heap.free_c(ptr) };
                     }
                 }
             },

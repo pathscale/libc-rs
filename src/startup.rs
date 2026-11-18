@@ -3,6 +3,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(feature = "alloc")]
+use alloc::boxed::Box;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 #[cfg(feature = "alloc")]
@@ -200,7 +202,7 @@ static AUX_EXECFN: AtomicU64 = AtomicU64::new(0);
 type EnvPairs = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[cfg(feature = "alloc")]
-static ENV_TABLE: FutexMutex<Option<EnvPairs>> = FutexMutex::new(None);
+static ENV_TABLE: FutexMutex<usize> = FutexMutex::new(0);
 
 /// Parses the initial EL0 process stack at `sp` (`argc`, `argv`, `envp`, `auxv`) and records
 /// process startup state.
@@ -229,7 +231,15 @@ pub unsafe fn init_from_stack(sp: *const u64) {
 
         #[cfg(feature = "alloc")]
         {
-            *ENV_TABLE.lock() = None;
+            let mut guard = ENV_TABLE.lock();
+            let prev = *guard;
+            if prev != 0 {
+                *guard = 0;
+                // SAFETY: Non-zero `prev` was created via `Box::into_raw` in `ensure_env_initialized`.
+                unsafe {
+                    drop(Box::from_raw(prev as *mut EnvPairs));
+                }
+            }
         }
 
         INITIALIZED.store(true, Ordering::Release);
@@ -322,8 +332,10 @@ pub fn args_vec() -> Vec<Vec<u8>> {
 }
 
 #[cfg(feature = "alloc")]
-fn ensure_env_initialized(guard: &mut Option<EnvPairs>) -> &mut EnvPairs {
-    if guard.is_none() {
+fn with_env_table<R>(f: impl FnOnce(&mut EnvPairs) -> R) -> R {
+    let mut guard = ENV_TABLE.lock();
+    let addr = *guard;
+    let mut boxed: Box<EnvPairs> = if addr == 0 {
         let mut entries: EnvPairs = Vec::new();
         if INITIALIZED.load(Ordering::Acquire) {
             let envp = ENVP_PTR.load(Ordering::Relaxed) as *const *const u8;
@@ -354,9 +366,15 @@ fn ensure_env_initialized(guard: &mut Option<EnvPairs>) -> &mut EnvPairs {
                 }
             }
         }
-        *guard = Some(entries);
-    }
-    guard.as_mut().unwrap()
+        Box::new(entries)
+    } else {
+        *guard = 0;
+        // SAFETY: Non-zero `addr` was stored from `Box::into_raw` below while holding `ENV_TABLE`.
+        unsafe { Box::from_raw(addr as *mut EnvPairs) }
+    };
+    let out = f(&mut boxed);
+    *guard = Box::into_raw(boxed) as usize;
+    out
 }
 
 /// Looks up the environment variable `name` and returns a cloned byte vector of its value.
@@ -366,12 +384,12 @@ pub fn getenv_vec(name: &[u8]) -> Option<Vec<u8>> {
     if name.is_empty() || memchr(b'=', name).is_some() || memchr(0, name).is_some() {
         return None;
     }
-    let mut guard = ENV_TABLE.lock();
-    let table = ensure_env_initialized(&mut guard);
-    table
-        .iter()
-        .find(|(k, _)| k.as_slice() == name)
-        .map(|(_, v)| v.clone())
+    with_env_table(|table| {
+        table
+            .iter()
+            .find(|(k, _)| k.as_slice() == name)
+            .map(|(_, v)| v.clone())
+    })
 }
 
 /// Inserts or updates the environment variable `name` with `value`.
@@ -388,39 +406,39 @@ pub fn setenv_bytes(name: &[u8], value: &[u8], overwrite: bool) -> SysResult<()>
         return Err(Errno(EINVAL));
     }
 
-    let mut guard = ENV_TABLE.lock();
-    let table = ensure_env_initialized(&mut guard);
-    if let Some((_, existing_val)) = table.iter_mut().find(|(k, _)| k.as_slice() == name) {
-        if overwrite {
-            existing_val.clear();
-            existing_val.extend_from_slice(value);
+    with_env_table(|table| {
+        if let Some((_, existing_val)) = table.iter_mut().find(|(k, _)| k.as_slice() == name) {
+            if overwrite {
+                existing_val.clear();
+                existing_val.extend_from_slice(value);
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    let mut k = Vec::with_capacity(name.len());
-    k.extend_from_slice(name);
-    let mut v = Vec::with_capacity(value.len());
-    v.extend_from_slice(value);
-    table.push((k, v));
-    Ok(())
+        let mut k = Vec::with_capacity(name.len());
+        k.extend_from_slice(name);
+        let mut v = Vec::with_capacity(value.len());
+        v.extend_from_slice(value);
+        table.push((k, v));
+        Ok(())
+    })
 }
 
 /// Returns all environment variables as `KEY=VALUE` byte vectors.
 #[cfg(feature = "alloc")]
 #[must_use]
 pub fn environ_vec() -> Vec<Vec<u8>> {
-    let mut guard = ENV_TABLE.lock();
-    let table = ensure_env_initialized(&mut guard);
-    let mut out = Vec::with_capacity(table.len());
-    for (k, v) in table.iter() {
-        let mut entry = Vec::with_capacity(k.len() + 1 + v.len());
-        entry.extend_from_slice(k);
-        entry.push(b'=');
-        entry.extend_from_slice(v);
-        out.push(entry);
-    }
-    out
+    with_env_table(|table| {
+        let mut out = Vec::with_capacity(table.len());
+        for (k, v) in table.iter() {
+            let mut entry = Vec::with_capacity(k.len() + 1 + v.len());
+            entry.extend_from_slice(k);
+            entry.push(b'=');
+            entry.extend_from_slice(v);
+            out.push(entry);
+        }
+        out
+    })
 }
 
 /// Emits a freestanding `aarch64-unknown-none` process entry point (`_start`), stack initializer,
@@ -432,15 +450,11 @@ macro_rules! process_entry {
         #[unsafe(naked)]
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn _start() -> ! {
-            core::arch::naked_asm!(
-                "mov x0, sp",
-                "bl {entry}",
-                "brk #0",
-                entry = sym _libc_rs_start_rust,
-            );
+            core::arch::naked_asm!("mov x0, sp", "bl _libc_rs_start_rust", "brk #0",);
         }
 
         #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+        #[unsafe(no_mangle)]
         extern "C" fn _libc_rs_start_rust(sp: *const u64) -> ! {
             // SAFETY: `sp` is the initial EL0 stack pointer passed from `_start`.
             unsafe {

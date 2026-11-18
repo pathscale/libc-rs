@@ -32,13 +32,15 @@ const JOIN_DETACHED: u32 = 1;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 const JOIN_EXITING: u32 = 2;
 
+const _: () = assert!(MAX_TLS_KEYS == 64);
+
 const TLS_KEY_FREE: u8 = 0;
 const TLS_KEY_IN_USE: u8 = 1;
 
 #[repr(C, align(64))]
 struct ThreadControlBlock {
     errno: UnsafeCell<i32>,
-    tls_values: UnsafeCell<[*mut u8; MAX_TLS_KEYS]>,
+    tls_values: UnsafeCell<[*mut u8; 64]>,
     child_tid: AtomicU32,
     join_state: AtomicU32,
     stack_map_base: *mut u8,
@@ -51,7 +53,7 @@ impl ThreadControlBlock {
     const fn new() -> Self {
         Self {
             errno: UnsafeCell::new(0),
-            tls_values: UnsafeCell::new([null_mut(); MAX_TLS_KEYS]),
+            tls_values: UnsafeCell::new([null_mut(); 64]),
             child_tid: AtomicU32::new(0),
             join_state: AtomicU32::new(JOIN_JOINABLE),
             stack_map_base: null_mut(),
@@ -64,45 +66,38 @@ impl ThreadControlBlock {
 
 #[repr(transparent)]
 struct SyncTcb(ThreadControlBlock);
-// SAFETY: `MAIN_TCB` is only accessed per-thread via `current_tcb()`.
+// SAFETY: `MAIN_TCB` is only accessed per-thread via `current_tcb_ptr()`.
 unsafe impl Sync for SyncTcb {}
 
 static MAIN_TCB: SyncTcb = SyncTcb(ThreadControlBlock::new());
 
 #[inline]
-fn current_tcb() -> &'static ThreadControlBlock {
-    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-    {
-        let mut tp: usize;
-        // SAFETY: `TPIDR_EL0` holds the thread's `ThreadControlBlock` pointer when set.
-        unsafe {
-            core::arch::asm!("mrs {}, tpidr_el0", out(reg) tp, options(nomem, nostack, preserves_flags));
-        }
-        if tp != 0 {
-            // SAFETY: Non-zero `TPIDR_EL0` points to a live `ThreadControlBlock`.
-            return unsafe { &*(tp as *const ThreadControlBlock) };
-        }
-    }
-    &MAIN_TCB.0
+fn current_tcb_ptr() -> *mut ThreadControlBlock {
+    let main_addr = core::ptr::addr_of!(MAIN_TCB.0) as usize;
+    let tp = crate::raw::read_thread_pointer();
+    let addr = if tp == 0 { main_addr } else { tp };
+    addr as *mut ThreadControlBlock
 }
 
 #[must_use]
 pub fn errno_cell() -> *mut i32 {
-    current_tcb().errno.get()
+    let tcb = current_tcb_ptr();
+    // SAFETY: `tcb` points to the calling thread's live `ThreadControlBlock`.
+    unsafe { (*tcb).errno.get() }
 }
 
 #[must_use]
 pub fn current_thread_id() -> u64 {
-    core::ptr::from_ref(current_tcb()) as usize as u64
+    current_tcb_ptr() as usize as u64
 }
 
-static TLS_KEY_STATE: [AtomicU8; MAX_TLS_KEYS] =
-    [const { AtomicU8::new(TLS_KEY_FREE) }; MAX_TLS_KEYS];
-static TLS_DTORS: [AtomicUsize; MAX_TLS_KEYS] = [const { AtomicUsize::new(0) }; MAX_TLS_KEYS];
+static TLS_KEY_STATE: [AtomicU8; 64] = [const { AtomicU8::new(TLS_KEY_FREE) }; 64];
+static TLS_DTORS: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
 
 #[must_use]
 pub fn tls_key_create(dtor: Option<unsafe extern "C" fn(*mut u8)>) -> Option<usize> {
     let dtor_addr = dtor.map_or(0, |f| f as usize);
+    let tcb = current_tcb_ptr();
     for key in 0..MAX_TLS_KEYS {
         if TLS_KEY_STATE[key]
             .compare_exchange(
@@ -115,7 +110,7 @@ pub fn tls_key_create(dtor: Option<unsafe extern "C" fn(*mut u8)>) -> Option<usi
         {
             TLS_DTORS[key].store(dtor_addr, Ordering::Release);
             // SAFETY: Clearing the calling thread's own TLS slot for the newly allocated key.
-            unsafe { (*current_tcb().tls_values.get())[key] = null_mut() };
+            unsafe { (*(*tcb).tls_values.get())[key] = null_mut() };
             return Some(key);
         }
     }
@@ -126,9 +121,10 @@ pub fn tls_key_delete(key: usize) {
     if key >= MAX_TLS_KEYS {
         return;
     }
+    let tcb = current_tcb_ptr();
     TLS_DTORS[key].store(0, Ordering::Release);
     // SAFETY: Clearing the calling thread's own TLS slot.
-    unsafe { (*current_tcb().tls_values.get())[key] = null_mut() };
+    unsafe { (*(*tcb).tls_values.get())[key] = null_mut() };
     TLS_KEY_STATE[key].store(TLS_KEY_FREE, Ordering::Release);
 }
 
@@ -137,27 +133,29 @@ pub fn tls_get(key: usize) -> *mut u8 {
     if key >= MAX_TLS_KEYS || TLS_KEY_STATE[key].load(Ordering::Acquire) != TLS_KEY_IN_USE {
         return null_mut();
     }
+    let tcb = current_tcb_ptr();
     // SAFETY: Reading the calling thread's own TLS slot.
-    unsafe { (*current_tcb().tls_values.get())[key] }
+    unsafe { (*(*tcb).tls_values.get())[key] }
 }
 
 pub fn tls_set(key: usize, val: *mut u8) -> bool {
     if key >= MAX_TLS_KEYS || TLS_KEY_STATE[key].load(Ordering::Acquire) != TLS_KEY_IN_USE {
         return false;
     }
+    let tcb = current_tcb_ptr();
     // SAFETY: Writing the calling thread's own TLS slot.
-    unsafe { (*current_tcb().tls_values.get())[key] = val };
+    unsafe { (*(*tcb).tls_values.get())[key] = val };
     true
 }
 
 pub fn run_current_thread_tls_destructors() {
-    let tcb = current_tcb();
+    let tcb = current_tcb_ptr();
     for key in 0..MAX_TLS_KEYS {
         // SAFETY: Accessing the calling thread's own TLS slot.
-        let val = unsafe { (*tcb.tls_values.get())[key] };
+        let val = unsafe { (*(*tcb).tls_values.get())[key] };
         if !val.is_null() {
             // SAFETY: Clearing the calling thread's own TLS slot before invoking the destructor.
-            unsafe { (*tcb.tls_values.get())[key] = null_mut() };
+            unsafe { (*(*tcb).tls_values.get())[key] = null_mut() };
             if TLS_KEY_STATE[key].load(Ordering::Acquire) == TLS_KEY_IN_USE {
                 let addr = TLS_DTORS[key].load(Ordering::Acquire);
                 if addr != 0 {
@@ -262,8 +260,9 @@ impl Drop for ThreadHandle {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-extern "C" fn child_thread_start(tcb_ptr: *mut ThreadControlBlock) -> ! {
-    // SAFETY: `tcb_ptr` is the valid `ThreadControlBlock` allocated by `spawn_thread`.
+unsafe extern "C" fn child_thread_start() -> ! {
+    let tcb_ptr = current_tcb_ptr();
+    // SAFETY: `CLONE_SETTLS` installed this child's valid `ThreadControlBlock` in `TPIDR_EL0`.
     unsafe {
         if let Some(entry) = (*tcb_ptr).entry_fn {
             entry((*tcb_ptr).entry_arg);
@@ -277,56 +276,8 @@ extern "C" fn child_thread_start(tcb_ptr: *mut ThreadControlBlock) -> ! {
         }
         let map_base = (*tcb_ptr).stack_map_base as usize;
         let map_len = (*tcb_ptr).stack_map_len;
-        core::arch::asm!(
-            "msr tpidr_el0, xzr",
-            "mov x8, {munmap_nr}",
-            "svc #0",
-            "mov x0, #0",
-            "mov x8, {exit_nr}",
-            "svc #0",
-            "brk #0",
-            munmap_nr = const crate::raw::nr::MUNMAP,
-            exit_nr = const crate::raw::nr::EXIT,
-            in("x0") map_base,
-            in("x1") map_len,
-            options(noreturn, nostack),
-        );
+        crate::raw::unmap_stack_and_exit(map_base, map_len)
     }
-}
-
-#[cfg(all(target_arch = "aarch64", target_os = "none"))]
-#[inline]
-unsafe fn raw_clone_thread(
-    flags: u64,
-    child_sp: usize,
-    parent_tid: usize,
-    tls: usize,
-    child_tid: usize,
-) -> SysResult<usize> {
-    let ret: usize;
-    // SAFETY: Caller sets up a valid `child_sp` with `tcb` at `[child_sp]` and valid TID/TLS pointers.
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            "cbnz x0, 2f",
-            "ldr x0, [sp]",
-            "add sp, sp, #16",
-            "mov x29, #0",
-            "mov x30, #0",
-            "bl {child_start}",
-            "brk #0",
-            "2:",
-            child_start = sym child_thread_start,
-            in("x8") crate::raw::nr::CLONE,
-            inlateout("x0") flags as usize => ret,
-            in("x1") child_sp,
-            in("x2") parent_tid,
-            in("x3") tls,
-            in("x4") child_tid,
-            options(nostack),
-        );
-    }
-    crate::raw::decode_raw(ret)
 }
 
 /// Spawns a new thread executing `entry(arg)` on a guarded stack.
@@ -382,11 +333,11 @@ pub unsafe fn spawn_thread(
         (*tcb).entry_arg = arg;
     }
 
-    let child_sp = (((map_base as usize) + total_map) & !15usize) - 16;
-    // SAFETY: `child_sp` lies at the top of the writable stack region above the guard page.
+    let child_sp = (((map_base as usize) + total_map) & !15usize) - 64;
+    // SAFETY: `child_sp` lies near the top of the writable stack region above the guard page with 64B headroom.
     unsafe {
         let frame = child_sp as *mut usize;
-        frame.write(tcb as usize);
+        frame.write(0);
         frame.add(1).write(0);
     }
 
@@ -408,8 +359,16 @@ pub unsafe fn spawn_thread(
 
     #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     // SAFETY: `child_sp`, `tcb`, and TID pointers are valid for `CLONE`.
-    let clone_res =
-        unsafe { raw_clone_thread(flags, child_sp, parent_tid_ptr, tcb as usize, child_tid_ptr) };
+    let clone_res = unsafe {
+        crate::raw::clone_thread(
+            flags,
+            child_sp,
+            parent_tid_ptr,
+            tcb as usize,
+            child_tid_ptr,
+            child_thread_start,
+        )
+    };
     #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
     // SAFETY: Invoking mocked/host `CLONE` syscall with validated stack and TCB pointers.
     let clone_res = unsafe {

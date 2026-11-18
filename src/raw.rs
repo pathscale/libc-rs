@@ -371,6 +371,160 @@ pub unsafe fn syscall6(
     }
 }
 
+/// Reads the hardware thread pointer register (`TPIDR_EL0`) on AArch64 EL0 targets,
+/// returning `0` on host test targets or before a thread control block is installed.
+#[must_use]
+#[inline]
+pub fn read_thread_pointer() -> usize {
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    {
+        let tp: usize;
+        // SAFETY: `TPIDR_EL0` is readable at EL0 with no memory side effects.
+        unsafe {
+            core::arch::asm!(
+                "mrs {}, tpidr_el0",
+                out(reg) tp,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        tp
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+    {
+        0
+    }
+}
+
+/// Reads the AArch64 timer frequency register (`CNTFRQ_EL0`) on EL0 targets.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[must_use]
+#[inline]
+pub(crate) fn read_cntfrq_el0() -> u64 {
+    let hz: u64;
+    // SAFETY: `cntfrq_el0` is readable from EL0 when `CNTKCTL_EL1.EL0VCTEN == 1`.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, cntfrq_el0",
+            out(reg) hz,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    hz
+}
+
+/// Reads the AArch64 virtual counter register (`CNTVCT_EL0`) on EL0 targets.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[must_use]
+#[inline]
+pub(crate) fn read_cntvct_el0() -> u64 {
+    let ticks: u64;
+    // SAFETY: `cntvct_el0` is readable from EL0 when `CNTKCTL_EL1.EL0VCTEN == 1`.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, cntvct_el0",
+            out(reg) ticks,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ticks
+}
+
+/// Restorer trampoline invoking `rt_sigreturn` (`nr::RT_SIGRETURN = 139`) for `SA_RESTORER`.
+///
+/// # Safety
+///
+/// Must only be invoked by the kernel signal-return path with a valid signal frame on the stack.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn default_sigrestorer() -> ! {
+    core::arch::naked_asm!("mov x8, #139", "svc #0", "brk #0",);
+}
+
+const _: () = {
+    assert!(nr::RT_SIGRETURN == 139);
+    assert!(nr::MUNMAP == 215);
+    assert!(nr::EXIT == 93);
+    assert!(nr::CLONE == 220);
+};
+
+/// Triggers an immediate hardware trap (`brk #0`) on AArch64 EL0 targets.
+pub(crate) fn trap_abort() -> ! {
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    // SAFETY: `brk #0` immediately traps execution at EL0 without touching memory or stack.
+    unsafe {
+        core::arch::asm!("brk #0", options(noreturn, nostack, nomem));
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+    {
+        panic!("abort")
+    }
+}
+
+/// Clears `TPIDR_EL0`, unmaps the calling detached thread's stack `[map_base, map_base + map_len)`,
+/// and terminates the calling thread via `SYS_EXIT` without touching stack memory.
+///
+/// # Safety
+///
+/// Must only be called as the final action of a detached thread whose stack mapping is
+/// `(map_base, map_len)` and with no live stack references remaining.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub unsafe fn unmap_stack_and_exit(map_base: usize, map_len: usize) -> ! {
+    // SAFETY: Caller guarantees no stack memory is accessed after `MUNMAP` and `EXIT` never returns.
+    unsafe {
+        core::arch::asm!(
+            "msr tpidr_el0, xzr",
+            "mov x8, #215",
+            "svc #0",
+            "mov x0, #0",
+            "mov x8, #93",
+            "svc #0",
+            "brk #0",
+            in("x0") map_base,
+            in("x1") map_len,
+            options(noreturn, nostack),
+        );
+    }
+}
+
+/// Spawns a child thread via `SYS_CLONE` on AArch64 EL0, invoking `child_entry()` when `CLONE`
+/// returns `0` in the newly created thread.
+///
+/// # Safety
+///
+/// `child_sp` must be 16-byte aligned with `[child_sp - 16, child_sp + 64)` mapped RW,
+/// `CLONE_SETTLS` must install a valid TCB in `tls` for `child_entry`, and `parent_tid`/`child_tid`
+/// must satisfy `CLONE` flags.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[inline(never)]
+pub unsafe fn clone_thread(
+    flags: u64,
+    child_sp: usize,
+    parent_tid: usize,
+    tls: usize,
+    child_tid: usize,
+    child_entry: unsafe extern "C" fn() -> !,
+) -> SysResult<usize> {
+    let ret: usize;
+    // SAFETY: Caller upholds `SYS_CLONE` stack, TLS, and TID pointer invariants.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") nr::CLONE,
+            inlateout("x0") flags as usize => ret,
+            in("x1") child_sp,
+            in("x2") parent_tid,
+            in("x3") tls,
+            in("x4") child_tid,
+            options(nostack, preserves_flags),
+        );
+    }
+    if ret == 0 {
+        // SAFETY: Running on the new child stack with `TPIDR_EL0 == tls`; `child_entry` never returns.
+        unsafe { child_entry() }
+    }
+    decode_raw(ret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,4 @@
-//! Pure-Rust `#![no_std]` floating-point intrinsics and hardware AArch64 instructions.
+//! Pure-Rust `#![no_std]` IEEE-754 floating-point intrinsics.
 
 const LN2_HI: f64 = 6.931_471_803_691_238e-1;
 const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
@@ -22,89 +22,38 @@ const EXP_P5: f64 = 4.138_136_797_057_238_5e-8;
 #[must_use]
 #[inline]
 pub fn floor(x: f64) -> f64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let out: f64;
-        // SAFETY: `frintm` is a pure scalar floating-point instruction with no memory side effects.
-        unsafe {
-            core::arch::asm!(
-                "frintm {:d}, {:d}",
-                out(vreg) out,
-                in(vreg) x,
-                options(pure, nomem, nostack),
-            );
-        }
-        out
+    if x.is_nan() || x.is_infinite() || x == 0.0 {
+        return x;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        if x.is_nan() || x.is_infinite() || x == 0.0 {
-            return x;
-        }
-        let t = trunc(x);
-        if x < t { t - 1.0 } else { t }
-    }
+    let t = trunc(x);
+    if x < t { t - 1.0 } else { t }
 }
 
 /// Returns the smallest integer greater than or equal to `x`.
 #[must_use]
 #[inline]
 pub fn ceil(x: f64) -> f64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let out: f64;
-        // SAFETY: `frintp` is a pure scalar floating-point instruction with no memory side effects.
-        unsafe {
-            core::arch::asm!(
-                "frintp {:d}, {:d}",
-                out(vreg) out,
-                in(vreg) x,
-                options(pure, nomem, nostack),
-            );
-        }
-        out
+    if x.is_nan() || x.is_infinite() || x == 0.0 {
+        return x;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        if x.is_nan() || x.is_infinite() || x == 0.0 {
-            return x;
-        }
-        let t = trunc(x);
-        if x > t { t + 1.0 } else { t }
-    }
+    let t = trunc(x);
+    if x > t { t + 1.0 } else { t }
 }
 
 /// Returns the integer part of `x`, rounding toward zero.
 #[must_use]
 #[inline]
 pub fn trunc(x: f64) -> f64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let out: f64;
-        // SAFETY: `frintz` is a pure scalar floating-point instruction with no memory side effects.
-        unsafe {
-            core::arch::asm!(
-                "frintz {:d}, {:d}",
-                out(vreg) out,
-                in(vreg) x,
-                options(pure, nomem, nostack),
-            );
-        }
-        out
+    let bits = x.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
+    if exp < 0 {
+        return f64::from_bits(bits & (1u64 << 63));
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let bits = x.to_bits();
-        let exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
-        if exp < 0 {
-            return f64::from_bits(bits & (1u64 << 63));
-        }
-        if exp >= 52 {
-            return x;
-        }
-        let mask = (1u64 << (52 - exp)) - 1;
-        f64::from_bits(bits & !mask)
+    if exp >= 52 {
+        return x;
     }
+    let mask = (1u64 << (52 - exp)) - 1;
+    f64::from_bits(bits & !mask)
 }
 
 /// Computes the natural logarithm $\ln(x)$ using the FDLIBM minimax approximation.

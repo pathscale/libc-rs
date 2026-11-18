@@ -761,11 +761,13 @@ mod tests {
                 let mut other = [b'.'; 128];
                 other[off + pos] = 0xa4;
                 let a_ptr = unsafe { hay.as_ptr().add(off) };
-                let b_ptr = unsafe { other.as_ptr().add(off) };
-                assert!(unsafe { compare_bytes(a_ptr, b_ptr, 80) } > 0);
-                assert!(unsafe { compare_bytes(b_ptr, a_ptr, 80) } < 0);
+                assert!(unsafe { compare_bytes(a_ptr, other.as_ptr().add(off), 80) } > 0);
+                assert!(unsafe { compare_bytes(other.as_ptr().add(off), a_ptr, 80) } < 0);
                 other[off + pos] = 0xa5;
-                assert_eq!(unsafe { compare_bytes(a_ptr, b_ptr, 80) }, 0);
+                assert_eq!(
+                    unsafe { compare_bytes(a_ptr, other.as_ptr().add(off), 80) },
+                    0
+                );
             }
         }
     }

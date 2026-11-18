@@ -56,30 +56,16 @@ pub fn clock_gettime(clock_id: i32) -> SysResult<Timespec> {
         static CACHED_HZ: AtomicU64 = AtomicU64::new(0);
         let mut hz = CACHED_HZ.load(Ordering::Relaxed);
         if hz == 0 {
-            // SAFETY: `cntfrq_el0` is readable from EL0 when `CNTKCTL_EL1.EL0VCTEN == 1`.
-            unsafe {
-                core::arch::asm!(
-                    "mrs {}, cntfrq_el0",
-                    out(reg) hz,
-                    options(nomem, nostack, preserves_flags),
-                );
-            }
+            hz = crate::raw::read_cntfrq_el0();
             if hz != 0 {
                 CACHED_HZ.store(hz, Ordering::Relaxed);
             }
         }
-        if hz != 0 {
-            let ticks: u64;
-            // SAFETY: `cntvct_el0` is readable from EL0 when `CNTKCTL_EL1.EL0VCTEN == 1`.
-            unsafe {
-                core::arch::asm!(
-                    "mrs {}, cntvct_el0",
-                    out(reg) ticks,
-                    options(nomem, nostack, preserves_flags),
-                );
-            }
-            let tv_sec = (ticks / hz) as i64;
-            let tv_nsec = (((ticks % hz) as u128 * 1_000_000_000) / (hz as u128)) as i64;
+        let ticks = crate::raw::read_cntvct_el0();
+        if let Some(secs) = ticks.checked_div(hz) {
+            let rem = ticks - secs * hz;
+            let tv_sec = secs as i64;
+            let tv_nsec = ((rem as u128 * 1_000_000_000) / (hz as u128)) as i64;
             return Ok(Timespec { tv_sec, tv_nsec });
         }
     }

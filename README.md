@@ -11,7 +11,7 @@ It intentionally is **not** POSIX or Linux `libc`:
 ## Modules
 
 - `errno`: `Errno` error code newtype, `SysResult<T>` alias, and standard error constants
-- `raw`: AArch64 `svc #0` raw syscall dispatch (`nr`, `decode_raw`, `syscall0`..`syscall6`)
+- `raw`: AArch64 `svc #0` raw syscall dispatch (`nr`, `decode_raw`, `syscall0`..`syscall6`) and EL0 hardware entry/thread/restorer stubs (`raw` is the sole inline-asm boundary)
 - `fd`: `RawFd`, `BorrowedFd`, `OwnedFd`, and `*at` flags
 - `mm`: `mmap`, `mmap_anonymous`, `munmap`, `mprotect`, `madvise`, `msync`, `mincore`
 - `io`: `read`, `write`, `pread`, `pwrite`, `writev`, `lseek`, `close`, `dup`, `dup2`, `dup3`, `pipe2`, `fcntl`, `ioctl`, `flock`
@@ -24,7 +24,7 @@ It intentionally is **not** POSIX or Linux `libc`:
 - `time`: `Timespec`, `Timeval`, `clock_gettime`, `clock_settime`, `nanosleep`
 - `rand`: `getrandom`, `fill_random`
 - `startup`: `init_from_stack`, `aux_summary`, `getauxval`, `page_size`, `args_vec`, `getenv_vec`, `setenv_bytes`, `environ_vec`, `process_entry!`, `declare_native_note!`
-- `math`: freestanding `floor`, `ceil`, `trunc`, `ln`, `powf` (hardware AArch64 `frint*` + pure-Rust IEEE-754 transcendentals)
+- `math`: freestanding `floor`, `ceil`, `trunc`, `ln`, `powf` (pure-Rust IEEE-754 rounding and transcendentals)
 - `heap`: `MmapHeap` (`GLOBAL_MMAP_HEAP`, `c_malloc`, `c_calloc`, `c_realloc`, `c_free`, `c_posix_memalign`)
 - `mem`: freestanding `copy_nonoverlapping_bytes`, `copy_bytes`, `set_bytes`, `compare_bytes`, `c_strlen`, `c_strnlen`, `memchr`, `memrchr`, `ct_eq`
 
