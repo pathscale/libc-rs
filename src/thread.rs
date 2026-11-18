@@ -38,8 +38,10 @@ const TLS_KEY_FREE: u8 = 0;
 const TLS_KEY_IN_USE: u8 = 1;
 
 #[repr(C, align(64))]
-struct ThreadControlBlock {
+pub(crate) struct ThreadControlBlock {
     errno: UnsafeCell<i32>,
+    pub(crate) mag_len: UnsafeCell<[u8; 8]>,
+    pub(crate) mag_ptrs: UnsafeCell<[[*mut u8; 8]; 8]>,
     tls_values: UnsafeCell<[*mut u8; 64]>,
     child_tid: AtomicU32,
     join_state: AtomicU32,
@@ -53,6 +55,8 @@ impl ThreadControlBlock {
     const fn new() -> Self {
         Self {
             errno: UnsafeCell::new(0),
+            mag_len: UnsafeCell::new([0; 8]),
+            mag_ptrs: UnsafeCell::new([[null_mut(); 8]; 8]),
             tls_values: UnsafeCell::new([null_mut(); 64]),
             child_tid: AtomicU32::new(0),
             join_state: AtomicU32::new(JOIN_JOINABLE),
@@ -72,7 +76,7 @@ unsafe impl Sync for SyncTcb {}
 static MAIN_TCB: SyncTcb = SyncTcb(ThreadControlBlock::new());
 
 #[inline]
-fn current_tcb_ptr() -> *mut ThreadControlBlock {
+pub(crate) fn current_tcb_ptr() -> *mut ThreadControlBlock {
     let main_addr = core::ptr::addr_of!(MAIN_TCB.0) as usize;
     let tp = crate::raw::read_thread_pointer();
     let addr = if tp == 0 { main_addr } else { tp };
@@ -80,6 +84,7 @@ fn current_tcb_ptr() -> *mut ThreadControlBlock {
 }
 
 #[must_use]
+#[inline]
 pub fn errno_cell() -> *mut i32 {
     let tcb = current_tcb_ptr();
     // SAFETY: `tcb` points to the calling thread's live `ThreadControlBlock`.
@@ -87,6 +92,7 @@ pub fn errno_cell() -> *mut i32 {
 }
 
 #[must_use]
+#[inline]
 pub fn current_thread_id() -> u64 {
     current_tcb_ptr() as usize as u64
 }
@@ -129,6 +135,7 @@ pub fn tls_key_delete(key: usize) {
 }
 
 #[must_use]
+#[inline]
 pub fn tls_get(key: usize) -> *mut u8 {
     if key >= MAX_TLS_KEYS || TLS_KEY_STATE[key].load(Ordering::Acquire) != TLS_KEY_IN_USE {
         return null_mut();
@@ -138,6 +145,7 @@ pub fn tls_get(key: usize) -> *mut u8 {
     unsafe { (*(*tcb).tls_values.get())[key] }
 }
 
+#[inline]
 pub fn tls_set(key: usize, val: *mut u8) -> bool {
     if key >= MAX_TLS_KEYS || TLS_KEY_STATE[key].load(Ordering::Acquire) != TLS_KEY_IN_USE {
         return false;
@@ -167,6 +175,8 @@ pub fn run_current_thread_tls_destructors() {
             }
         }
     }
+    #[cfg(feature = "alloc")]
+    crate::heap::flush_current_thread_magazine();
 }
 
 pub struct ThreadHandle {

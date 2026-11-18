@@ -56,33 +56,10 @@ pub fn trunc(x: f64) -> f64 {
     f64::from_bits(bits & !mask)
 }
 
-/// Computes the natural logarithm $\ln(x)$ using the FDLIBM minimax approximation.
-#[must_use]
-pub fn ln(x: f64) -> f64 {
-    if x.is_nan() || x < 0.0 {
-        return f64::NAN;
-    }
-    if x == 0.0 {
-        return f64::NEG_INFINITY;
-    }
-    if x == f64::INFINITY {
-        return f64::INFINITY;
-    }
-    if x == 1.0 {
-        return 0.0;
-    }
-
-    let mut ux = x.to_bits();
-    let mut k = 0i32;
-    if (ux >> 52) == 0 {
-        // Subnormal input: scale up by 2^52.
-        ux = (x * ((1u64 << 52) as f64)).to_bits();
-        k -= 52;
-    }
-
-    k += ((ux >> 52) as i32) - 1023;
+#[inline(always)]
+fn ln_pos_normal(ux: u64) -> f64 {
+    let mut k = ((ux >> 52) as i32) - 1023;
     let mant_hi = ((ux >> 32) as u32) & 0x000f_ffff;
-    // Center reduced mantissa around [sqrt(2)/2, sqrt(2)].
     let offset = (mant_hi + 0x95f64) & 0x0010_0000;
     let m_bits = (ux & 0x000f_ffff_ffff_ffff) | (((offset ^ 0x3ff0_0000) as u64) << 32);
     k += (offset >> 20) as i32;
@@ -100,7 +77,55 @@ pub fn ln(x: f64) -> f64 {
     dk * LN2_HI - ((hfsq - (s * (hfsq + r) + dk * LN2_LO)) - f)
 }
 
+#[cold]
+#[inline(never)]
+fn ln_special(x: f64) -> f64 {
+    if x.is_nan() || x < 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if x == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    if x == 1.0 {
+        return 0.0;
+    }
+    let ux = (x * ((1u64 << 52) as f64)).to_bits();
+    let mut k = ((ux >> 52) as i32) - 1023 - 52;
+    let mant_hi = ((ux >> 32) as u32) & 0x000f_ffff;
+    let offset = (mant_hi + 0x95f64) & 0x0010_0000;
+    let m_bits = (ux & 0x000f_ffff_ffff_ffff) | (((offset ^ 0x3ff0_0000) as u64) << 32);
+    k += (offset >> 20) as i32;
+
+    let f = f64::from_bits(m_bits) - 1.0;
+    let s = f / (2.0 + f);
+    let z = s * s;
+    let w = z * z;
+    let t1 = w * (LG2 + w * (LG4 + w * LG6));
+    let t2 = z * (LG1 + w * (LG3 + w * (LG5 + w * LG7)));
+    let r = t2 + t1;
+    let hfsq = 0.5 * f * f;
+    let dk = k as f64;
+
+    dk * LN2_HI - ((hfsq - (s * (hfsq + r) + dk * LN2_LO)) - f)
+}
+
+/// Computes the natural logarithm $\ln(x)$ using the FDLIBM minimax approximation.
+#[must_use]
+#[inline]
+pub fn ln(x: f64) -> f64 {
+    let ux = x.to_bits();
+    if ux.wrapping_sub(0x0010_0000_0000_0000) < 0x7fe0_0000_0000_0000 && ux != 0x3ff0_0000_0000_0000
+    {
+        return ln_pos_normal(ux);
+    }
+    ln_special(x)
+}
+
 /// Computes $e^x$ using the FDLIBM range reduction and Remez rational approximation.
+#[inline]
 fn exp(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
@@ -115,11 +140,7 @@ fn exp(x: f64) -> f64 {
         return 1.0;
     }
 
-    let k = if x >= 0.0 {
-        floor(x * INV_LN2 + 0.5) as i32
-    } else {
-        ceil(x * INV_LN2 - 0.5) as i32
-    };
+    let k = (x * INV_LN2 + if x >= 0.0 { 0.5 } else { -0.5 }) as i32;
     let dk = k as f64;
     let hi = x - dk * LN2_HI;
     let lo = dk * LN2_LO;
@@ -182,9 +203,9 @@ fn powi_small(mut base: f64, exp_val: i32) -> f64 {
     acc
 }
 
-/// Computes $x^y$ following IEEE-754 special-case rules.
-#[must_use]
-pub fn powf(x: f64, y: f64) -> f64 {
+#[cold]
+#[inline(never)]
+fn powf_special(x: f64, y: f64) -> f64 {
     if y == 0.0 || x == 1.0 {
         return 1.0;
     }
@@ -252,6 +273,27 @@ pub fn powf(x: f64, y: f64) -> f64 {
     }
 
     sign * exp(y * ln(ax))
+}
+
+/// Computes $x^y$ following IEEE-754 special-case rules.
+#[must_use]
+#[inline]
+pub fn powf(x: f64, y: f64) -> f64 {
+    let ux = x.to_bits();
+    let ay_bits = y.to_bits() & 0x7fff_ffff_ffff_ffff;
+    if ux.wrapping_sub(0x0010_0000_0000_0000) < 0x7fe0_0000_0000_0000
+        && ux != 0x3ff0_0000_0000_0000
+        && ay_bits.wrapping_sub(0x0010_0000_0000_0000) < 0x7fe0_0000_0000_0000
+    {
+        if ay_bits <= 0x4050_0000_0000_0000 {
+            let yi = y as i32;
+            if (yi as f64) == y {
+                return powi_small(x, yi);
+            }
+        }
+        return exp(y * ln_pos_normal(ux));
+    }
+    powf_special(x, y)
 }
 
 #[cfg(test)]

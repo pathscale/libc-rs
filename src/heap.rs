@@ -73,6 +73,7 @@ impl ThreadMagazineSlot {
     }
 }
 
+#[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
 #[inline]
 fn current_magazine_slot_index() -> usize {
     let tid = crate::thread::current_thread_id();
@@ -86,14 +87,13 @@ const fn mmap_small_class_index(size: usize) -> Option<usize> {
         Some(v) => v,
         None => return None,
     };
-    let mut i = 0;
-    while i < MMAP_NUM_CLASSES {
-        if total <= MMAP_CLASS_TOTAL_SIZES[i] {
-            return Some(i);
-        }
-        i += 1;
+    if total > 4096 {
+        return None;
     }
-    None
+    if total <= 32 {
+        return Some(0);
+    }
+    Some((usize::BITS - 5 - (total - 1).leading_zeros()) as usize)
 }
 
 struct MmapHeapInner {
@@ -172,7 +172,49 @@ impl MmapHeapInner {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+const TCB_MAG_CAP: usize = 8;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+const TCB_MAG_BATCH: usize = 4;
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
 static GLOBAL_MAGAZINES: [ThreadMagazineSlot; 64] = [const { ThreadMagazineSlot::new() }; 64];
+
+pub(crate) fn flush_current_thread_magazine() {
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    {
+        let tcb = crate::thread::current_tcb_ptr();
+        // SAFETY: Accessing the calling thread's own inline TCB magazine arrays on thread exit.
+        unsafe {
+            let lens = &mut *(*tcb).mag_len.get();
+            let ptrs = &mut *(*tcb).mag_ptrs.get();
+            let mut any = false;
+            let mut c = 0;
+            while c < MMAP_NUM_CLASSES {
+                if lens[c] != 0 {
+                    any = true;
+                    break;
+                }
+                c += 1;
+            }
+            if !any {
+                return;
+            }
+            let mut inner = GLOBAL_MMAP_HEAP.inner.lock();
+            let mut cls = 0;
+            while cls < MMAP_NUM_CLASSES {
+                let mut n = lens[cls] as usize;
+                lens[cls] = 0;
+                while n > 0 {
+                    n -= 1;
+                    let victim_block = ptrs[cls][n].sub(MMAP_HEADER_BYTES);
+                    inner.free_small(victim_block, cls);
+                }
+                cls += 1;
+            }
+        }
+    }
+}
 
 /// Dynamic virtual-memory allocator backed by `mmap_anonymous` slabs for small blocks
 /// (`<= 4080` bytes) and direct page-granularity `mmap_anonymous`/`munmap` mappings for
@@ -209,42 +251,106 @@ impl MmapHeap {
 
     #[inline]
     unsafe fn alloc_small_cached(&self, class_idx: usize) -> *mut u8 {
-        let slot = &GLOBAL_MAGAZINES[current_magazine_slot_index()];
-        if slot
-            .in_use
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
         {
-            // SAFETY: `slot.in_use` is exclusively held by the current thread.
-            let mag = unsafe { &mut (*slot.classes.get())[class_idx] };
-            if mag.len > 0 {
-                mag.len -= 1;
-                let ptr = mag.ptrs[mag.len];
-                slot.in_use.store(false, Ordering::Release);
-                return ptr;
+            let tcb = crate::thread::current_tcb_ptr();
+            // SAFETY: `tcb` belongs exclusively to the calling thread.
+            unsafe {
+                let lens = &mut *(*tcb).mag_len.get();
+                let n = lens[class_idx] as usize;
+                if n > 0 {
+                    let next = n - 1;
+                    lens[class_idx] = next as u8;
+                    return (*(*tcb).mag_ptrs.get())[class_idx][next];
+                }
+                return self.alloc_small_refill_tcb(tcb, class_idx);
             }
-
-            let mut inner = self.inner.lock();
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+        {
+            let slot = &GLOBAL_MAGAZINES[current_magazine_slot_index()];
+            if slot
+                .in_use
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                // SAFETY: `slot.in_use` is exclusively held by the current thread.
+                let mag = unsafe { &mut (*slot.classes.get())[class_idx] };
+                if mag.len > 0 {
+                    mag.len -= 1;
+                    let ptr = mag.ptrs[mag.len];
+                    slot.in_use.store(false, Ordering::Release);
+                    return ptr;
+                }
+                // SAFETY: `slot.in_use` is held by the caller and released inside `alloc_small_refill`.
+                return unsafe { self.alloc_small_refill(slot, class_idx) };
+            }
             // SAFETY: `class_idx` is a valid small class index.
-            let first = unsafe { inner.alloc_small(class_idx) };
-            if !first.is_null() {
+            unsafe { self.alloc_small_contended(class_idx) }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    #[cold]
+    #[inline(never)]
+    unsafe fn alloc_small_refill_tcb(
+        &self,
+        tcb: *mut crate::thread::ThreadControlBlock,
+        class_idx: usize,
+    ) -> *mut u8 {
+        let mut inner = self.inner.lock();
+        let first = unsafe { inner.alloc_small(class_idx) };
+        if !first.is_null() {
+            unsafe {
+                let lens = &mut *(*tcb).mag_len.get();
+                let ptrs = &mut *(*tcb).mag_ptrs.get();
+                let mut n = lens[class_idx] as usize;
                 let mut i = 1;
-                while i < MAGAZINE_BATCH && mag.len < MAGAZINE_CAP {
-                    // SAFETY: `class_idx` is a valid small class index.
-                    let extra = unsafe { inner.alloc_small(class_idx) };
+                while i < TCB_MAG_BATCH && n < TCB_MAG_CAP {
+                    let extra = inner.alloc_small(class_idx);
                     if extra.is_null() {
                         break;
                     }
-                    mag.ptrs[mag.len] = extra;
-                    mag.len += 1;
+                    ptrs[class_idx][n] = extra;
+                    n += 1;
                     i += 1;
                 }
+                lens[class_idx] = n as u8;
             }
-            drop(inner);
-            slot.in_use.store(false, Ordering::Release);
-            return first;
         }
+        first
+    }
 
+    #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+    #[cold]
+    #[inline(never)]
+    unsafe fn alloc_small_refill(&self, slot: &ThreadMagazineSlot, class_idx: usize) -> *mut u8 {
+        // SAFETY: `slot.in_use` was acquired by `alloc_small_cached`.
+        let mag = unsafe { &mut (*slot.classes.get())[class_idx] };
+        let mut inner = self.inner.lock();
+        // SAFETY: `class_idx` is a valid small class index.
+        let first = unsafe { inner.alloc_small(class_idx) };
+        if !first.is_null() {
+            let mut i = 1;
+            while i < MAGAZINE_BATCH && mag.len < MAGAZINE_CAP {
+                // SAFETY: `class_idx` is a valid small class index.
+                let extra = unsafe { inner.alloc_small(class_idx) };
+                if extra.is_null() {
+                    break;
+                }
+                mag.ptrs[mag.len] = extra;
+                mag.len += 1;
+                i += 1;
+            }
+        }
+        drop(inner);
+        slot.in_use.store(false, Ordering::Release);
+        first
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn alloc_small_contended(&self, class_idx: usize) -> *mut u8 {
         let mut inner = self.inner.lock();
         // SAFETY: `class_idx` is a valid small class index.
         unsafe { inner.alloc_small(class_idx) }
@@ -252,38 +358,100 @@ impl MmapHeap {
 
     #[inline]
     unsafe fn free_small_cached(&self, ptr: *mut u8, block_ptr: *mut u8, class_idx: usize) {
-        let slot = &GLOBAL_MAGAZINES[current_magazine_slot_index()];
-        if slot
-            .in_use
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
         {
-            // SAFETY: `slot.in_use` is exclusively held by the current thread.
-            let mag = unsafe { &mut (*slot.classes.get())[class_idx] };
-            if mag.len < MAGAZINE_CAP {
-                mag.ptrs[mag.len] = ptr;
-                mag.len += 1;
-                slot.in_use.store(false, Ordering::Release);
+            let _ = block_ptr;
+            let tcb = crate::thread::current_tcb_ptr();
+            // SAFETY: `tcb` belongs exclusively to the calling thread.
+            unsafe {
+                let lens = &mut *(*tcb).mag_len.get();
+                let n = lens[class_idx] as usize;
+                if n < TCB_MAG_CAP {
+                    (*(*tcb).mag_ptrs.get())[class_idx][n] = ptr;
+                    lens[class_idx] = (n + 1) as u8;
+                    return;
+                }
+                self.free_small_spill_tcb(tcb, ptr, class_idx);
                 return;
             }
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+        {
+            let slot = &GLOBAL_MAGAZINES[current_magazine_slot_index()];
+            if slot
+                .in_use
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                // SAFETY: `slot.in_use` is exclusively held by the current thread.
+                let mag = unsafe { &mut (*slot.classes.get())[class_idx] };
+                if mag.len < MAGAZINE_CAP {
+                    mag.ptrs[mag.len] = ptr;
+                    mag.len += 1;
+                    slot.in_use.store(false, Ordering::Release);
+                    return;
+                }
+                // SAFETY: `slot.in_use` is held by the caller and released inside `free_small_spill`.
+                unsafe { self.free_small_spill(slot, ptr, class_idx) };
+                return;
+            }
+            // SAFETY: `block_ptr` is a small slab block for `class_idx`.
+            unsafe { self.free_small_contended(block_ptr, class_idx) };
+        }
+    }
 
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    #[cold]
+    #[inline(never)]
+    unsafe fn free_small_spill_tcb(
+        &self,
+        tcb: *mut crate::thread::ThreadControlBlock,
+        ptr: *mut u8,
+        class_idx: usize,
+    ) {
+        unsafe {
+            let lens = &mut *(*tcb).mag_len.get();
+            let ptrs = &mut *(*tcb).mag_ptrs.get();
+            let mut n = lens[class_idx] as usize;
             let mut inner = self.inner.lock();
             let mut spilled = 0;
-            while spilled < MAGAZINE_BATCH && mag.len > 0 {
-                mag.len -= 1;
-                let victim_ptr = mag.ptrs[mag.len];
-                // SAFETY: `victim_ptr` is a small user pointer preceded by `MMAP_HEADER_BYTES`.
-                let victim_block = unsafe { victim_ptr.sub(MMAP_HEADER_BYTES) };
-                unsafe { inner.free_small(victim_block, class_idx) };
+            while spilled < TCB_MAG_BATCH && n > 0 {
+                n -= 1;
+                let victim_block = ptrs[class_idx][n].sub(MMAP_HEADER_BYTES);
+                inner.free_small(victim_block, class_idx);
                 spilled += 1;
             }
             drop(inner);
-            mag.ptrs[mag.len] = ptr;
-            mag.len += 1;
-            slot.in_use.store(false, Ordering::Release);
-            return;
+            ptrs[class_idx][n] = ptr;
+            lens[class_idx] = (n + 1) as u8;
         }
+    }
 
+    #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+    #[cold]
+    #[inline(never)]
+    unsafe fn free_small_spill(&self, slot: &ThreadMagazineSlot, ptr: *mut u8, class_idx: usize) {
+        // SAFETY: `slot.in_use` was acquired by `free_small_cached`.
+        let mag = unsafe { &mut (*slot.classes.get())[class_idx] };
+        let mut inner = self.inner.lock();
+        let mut spilled = 0;
+        while spilled < MAGAZINE_BATCH && mag.len > 0 {
+            mag.len -= 1;
+            let victim_ptr = mag.ptrs[mag.len];
+            // SAFETY: `victim_ptr` is a small user pointer preceded by `MMAP_HEADER_BYTES`.
+            let victim_block = unsafe { victim_ptr.sub(MMAP_HEADER_BYTES) };
+            unsafe { inner.free_small(victim_block, class_idx) };
+            spilled += 1;
+        }
+        drop(inner);
+        mag.ptrs[mag.len] = ptr;
+        mag.len += 1;
+        slot.in_use.store(false, Ordering::Release);
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn free_small_contended(&self, block_ptr: *mut u8, class_idx: usize) {
         let mut inner = self.inner.lock();
         // SAFETY: `block_ptr` is a small slab block for `class_idx`.
         unsafe { inner.free_small(block_ptr, class_idx) };
@@ -295,6 +463,7 @@ impl MmapHeap {
     /// # Safety
     ///
     /// Any non-null pointer returned must be released via [`MmapHeap::free_c`] or [`MmapHeap::realloc_c`].
+    #[inline]
     pub unsafe fn alloc_c(&self, size: usize, align: usize) -> *mut u8 {
         let eff_align = if align < 16 { 16 } else { align };
         if !eff_align.is_power_of_two() {
@@ -308,9 +477,8 @@ impl MmapHeap {
                     // SAFETY: `class_idx` is a valid small class index.
                     return unsafe { self.alloc_small_cached(class_idx) };
                 }
-                let mut inner = self.inner.lock();
                 // SAFETY: `class_idx` is a valid small class index.
-                return unsafe { inner.alloc_small(class_idx) };
+                return unsafe { self.alloc_small_contended(class_idx) };
             }
         }
 
@@ -318,6 +486,8 @@ impl MmapHeap {
         unsafe { Self::alloc_large(req_size, eff_align) }
     }
 
+    #[cold]
+    #[inline(never)]
     unsafe fn alloc_large(size: usize, align: usize) -> *mut u8 {
         let extra = match align.checked_add(MMAP_LARGE_HEADER_BYTES) {
             Some(v) => v,
@@ -404,6 +574,7 @@ impl MmapHeap {
     /// # Safety
     ///
     /// `ptr` must be null or a live pointer allocated by this [`MmapHeap`].
+    #[inline]
     pub unsafe fn free_c(&self, ptr: *mut u8) {
         if ptr.is_null() {
             return;
@@ -421,21 +592,27 @@ impl MmapHeap {
                     unsafe { self.free_small_cached(ptr, block_ptr, class_idx) };
                     return;
                 }
-                let mut inner = self.inner.lock();
                 // SAFETY: `block_ptr` is a small slab block for `class_idx`.
-                unsafe { inner.free_small(block_ptr, class_idx) };
+                unsafe { self.free_small_contended(block_ptr, class_idx) };
             }
             return;
         }
 
         if magic == LARGE_MAGIC {
-            // SAFETY: Large allocations store `[base_addr, map_total_len]` in the 16 bytes before `hdr`.
-            unsafe {
-                let large_hdr = ptr.sub(MMAP_LARGE_HEADER_BYTES).cast::<usize>();
-                let base_addr = large_hdr.read();
-                let map_total_len = large_hdr.add(1).read();
-                let _ = crate::mm::munmap(base_addr as *mut u8, map_total_len);
-            }
+            // SAFETY: `ptr` has `LARGE_MAGIC` header immediately preceding it.
+            unsafe { Self::free_large(ptr) };
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn free_large(ptr: *mut u8) {
+        // SAFETY: Large allocations store `[base_addr, map_total_len]` in the 16 bytes before `hdr`.
+        unsafe {
+            let large_hdr = ptr.sub(MMAP_LARGE_HEADER_BYTES).cast::<usize>();
+            let base_addr = large_hdr.read();
+            let map_total_len = large_hdr.add(1).read();
+            let _ = crate::mm::munmap(base_addr as *mut u8, map_total_len);
         }
     }
 
@@ -515,11 +692,13 @@ impl MmapHeap {
 }
 
 unsafe impl core::alloc::GlobalAlloc for MmapHeap {
+    #[inline]
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
         // SAFETY: Forwarding `GlobalAlloc::alloc` to `alloc_c`.
         unsafe { self.alloc_c(layout.size(), layout.align()) }
     }
 
+    #[inline]
     unsafe fn alloc_zeroed(&self, layout: core::alloc::Layout) -> *mut u8 {
         if layout.align() <= 16 {
             // SAFETY: `calloc_c` returns 16-byte aligned zeroed memory.
@@ -536,11 +715,13 @@ unsafe impl core::alloc::GlobalAlloc for MmapHeap {
         }
     }
 
+    #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: core::alloc::Layout) {
         // SAFETY: `ptr` was allocated by `self`.
         unsafe { self.free_c(ptr) }
     }
 
+    #[inline]
     unsafe fn realloc(
         &self,
         ptr: *mut u8,
@@ -578,6 +759,7 @@ pub static GLOBAL_MMAP_HEAP: MmapHeap = MmapHeap::new_cached();
 /// # Safety
 ///
 /// Returned memory is uninitialized and must be released with [`c_free`] or [`c_realloc`].
+#[inline]
 pub unsafe fn c_malloc(size: usize) -> *mut u8 {
     // SAFETY: Delegating to `GLOBAL_MMAP_HEAP.alloc_c`.
     unsafe { GLOBAL_MMAP_HEAP.alloc_c(size, 16) }
@@ -610,6 +792,7 @@ pub unsafe fn c_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
 ///
 /// `ptr` must be null or a live pointer returned by `c_malloc`, `c_calloc`,
 /// `c_realloc`, or `c_posix_memalign`.
+#[inline]
 pub unsafe fn c_free(ptr: *mut u8) {
     // SAFETY: Delegating to `GLOBAL_MMAP_HEAP.free_c`.
     unsafe { GLOBAL_MMAP_HEAP.free_c(ptr) }
