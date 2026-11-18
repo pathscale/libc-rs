@@ -27,13 +27,66 @@ fn last_match_index_le(mask: u64) -> usize {
 }
 
 #[inline(always)]
-unsafe fn read_u64_unaligned(ptr: *const u8) -> u64 {
-    unsafe { ptr.cast::<u64>().read_unaligned() }
+unsafe fn read_u64_aligned(ptr: *const u8) -> u64 {
+    debug_assert_eq!((ptr as usize) & 7, 0);
+    unsafe { *ptr.cast::<u64>() }
 }
 
 #[inline(always)]
-unsafe fn write_u64_unaligned(ptr: *mut u8, val: u64) {
-    unsafe { ptr.cast::<u64>().write_unaligned(val) }
+unsafe fn write_u64_aligned(ptr: *mut u8, val: u64) {
+    debug_assert_eq!((ptr as usize) & 7, 0);
+    unsafe {
+        *ptr.cast::<u64>() = val;
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn copy_forward_misaligned(
+    dst: *mut u8,
+    src: *const u8,
+    mut i: usize,
+    n: usize,
+    src_off: usize,
+) -> usize {
+    if n - i >= 16 {
+        let k = 8 - src_off;
+        let rshift = (src_off * 8) as u32;
+        let lshift = (k * 8) as u32;
+        let mut low: u64 = 0;
+        let mut b = 0;
+        while b < k {
+            low |= (unsafe { *src.add(i + b) } as u64) << (b * 8);
+            b += 1;
+        }
+
+        while n - i >= 40 {
+            unsafe {
+                let s_al = src.add(i + k);
+                let d_al = dst.add(i);
+                let w0 = u64::from_le(read_u64_aligned(s_al));
+                let w1 = u64::from_le(read_u64_aligned(s_al.add(8)));
+                let w2 = u64::from_le(read_u64_aligned(s_al.add(16)));
+                let w3 = u64::from_le(read_u64_aligned(s_al.add(24)));
+                write_u64_aligned(d_al, (low | (w0 << lshift)).to_le());
+                write_u64_aligned(d_al.add(8), ((w0 >> rshift) | (w1 << lshift)).to_le());
+                write_u64_aligned(d_al.add(16), ((w1 >> rshift) | (w2 << lshift)).to_le());
+                write_u64_aligned(d_al.add(24), ((w2 >> rshift) | (w3 << lshift)).to_le());
+                low = w3 >> rshift;
+            }
+            i += 32;
+        }
+
+        while n - i >= 16 {
+            unsafe {
+                let w0 = u64::from_le(read_u64_aligned(src.add(i + k)));
+                write_u64_aligned(dst.add(i), (low | (w0 << lshift)).to_le());
+                low = w0 >> rshift;
+            }
+            i += 8;
+        }
+    }
+    i
 }
 
 /// Copies `n` bytes from `src` to `dst`.
@@ -47,125 +100,87 @@ pub unsafe fn copy_nonoverlapping_bytes(dst: *mut u8, src: *const u8, n: usize) 
     let src = black_box(src);
     let mut i = 0;
 
-    #[cfg(target_arch = "aarch64")]
-    {
-        if n >= 16 {
-            let misalign = (dst as usize) & 15;
-            if misalign != 0 {
-                let prolog = (16 - misalign).min(n);
-                while i < prolog {
-                    unsafe {
-                        *dst.add(i) = *src.add(i);
-                    }
-                    i += 1;
+    if n >= 16 {
+        let misalign = (dst as usize) & 15;
+        if misalign != 0 {
+            let prolog = (16 - misalign) & 15;
+            while i < prolog {
+                unsafe {
+                    *dst.add(i) = black_box(*src.add(i));
                 }
+                i += 1;
             }
+        }
 
+        let src_off = (unsafe { src.add(i) } as usize) & 7;
+        if src_off == 0 {
             while n - i >= 64 {
                 unsafe {
-                    let s = src.add(i);
-                    let d = dst.add(i);
-                    let w0 = read_u64_unaligned(s);
-                    let w1 = read_u64_unaligned(s.add(8));
-                    let w2 = read_u64_unaligned(s.add(16));
-                    let w3 = read_u64_unaligned(s.add(24));
-                    let w4 = read_u64_unaligned(s.add(32));
-                    let w5 = read_u64_unaligned(s.add(40));
-                    let w6 = read_u64_unaligned(s.add(48));
-                    let w7 = read_u64_unaligned(s.add(56));
-                    write_u64_unaligned(d, w0);
-                    write_u64_unaligned(d.add(8), w1);
-                    write_u64_unaligned(d.add(16), w2);
-                    write_u64_unaligned(d.add(24), w3);
-                    write_u64_unaligned(d.add(32), w4);
-                    write_u64_unaligned(d.add(40), w5);
-                    write_u64_unaligned(d.add(48), w6);
-                    write_u64_unaligned(d.add(56), w7);
+                    let s = src.add(i).cast::<u64>();
+                    let d = dst.add(i).cast::<u64>();
+                    let w0 = black_box(*s);
+                    let w1 = *s.add(1);
+                    let w2 = *s.add(2);
+                    let w3 = *s.add(3);
+                    let w4 = *s.add(4);
+                    let w5 = *s.add(5);
+                    let w6 = *s.add(6);
+                    let w7 = *s.add(7);
+                    *d = w0;
+                    *d.add(1) = w1;
+                    *d.add(2) = w2;
+                    *d.add(3) = w3;
+                    *d.add(4) = w4;
+                    *d.add(5) = w5;
+                    *d.add(6) = w6;
+                    *d.add(7) = w7;
                 }
                 i += 64;
             }
 
-            while n - i >= 16 {
+            if n - i >= 32 {
                 unsafe {
                     let s = src.add(i);
                     let d = dst.add(i);
-                    let w0 = read_u64_unaligned(s);
-                    let w1 = read_u64_unaligned(s.add(8));
-                    write_u64_unaligned(d, w0);
-                    write_u64_unaligned(d.add(8), w1);
+                    let w0 = read_u64_aligned(s);
+                    let w1 = read_u64_aligned(s.add(8));
+                    let w2 = read_u64_aligned(s.add(16));
+                    let w3 = read_u64_aligned(s.add(24));
+                    write_u64_aligned(d, w0);
+                    write_u64_aligned(d.add(8), w1);
+                    write_u64_aligned(d.add(16), w2);
+                    write_u64_aligned(d.add(24), w3);
+                }
+                i += 32;
+            }
+
+            if n - i >= 16 {
+                unsafe {
+                    let s = src.add(i);
+                    let d = dst.add(i);
+                    let w0 = read_u64_aligned(s);
+                    let w1 = read_u64_aligned(s.add(8));
+                    write_u64_aligned(d, w0);
+                    write_u64_aligned(d.add(8), w1);
                 }
                 i += 16;
             }
 
             if n - i >= 8 {
                 unsafe {
-                    let w = read_u64_unaligned(src.add(i));
-                    write_u64_unaligned(dst.add(i), w);
+                    let w = read_u64_aligned(src.add(i));
+                    write_u64_aligned(dst.add(i), w);
                 }
                 i += 8;
             }
-        } else if n >= 8 {
-            unsafe {
-                let first = read_u64_unaligned(src);
-                let last = read_u64_unaligned(src.add(n - 8));
-                write_u64_unaligned(dst, first);
-                write_u64_unaligned(dst.add(n - 8), last);
-            }
-            return dst;
-        }
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        if n >= 16 {
-            let misalign = (dst as usize) & 7;
-            if misalign != 0 {
-                let prolog = (8 - misalign).min(n);
-                while i < prolog {
-                    unsafe {
-                        *dst.add(i) = *src.add(i);
-                    }
-                    i += 1;
-                }
-            }
-
-            while n - i >= 64 {
-                unsafe {
-                    let s = src.add(i);
-                    let d = dst.add(i);
-                    let w0 = read_u64_unaligned(s);
-                    let w1 = read_u64_unaligned(s.add(8));
-                    let w2 = read_u64_unaligned(s.add(16));
-                    let w3 = read_u64_unaligned(s.add(24));
-                    let w4 = read_u64_unaligned(s.add(32));
-                    let w5 = read_u64_unaligned(s.add(40));
-                    let w6 = read_u64_unaligned(s.add(48));
-                    let w7 = read_u64_unaligned(s.add(56));
-                    write_u64_unaligned(d, w0);
-                    write_u64_unaligned(d.add(8), w1);
-                    write_u64_unaligned(d.add(16), w2);
-                    write_u64_unaligned(d.add(24), w3);
-                    write_u64_unaligned(d.add(32), w4);
-                    write_u64_unaligned(d.add(40), w5);
-                    write_u64_unaligned(d.add(48), w6);
-                    write_u64_unaligned(d.add(56), w7);
-                }
-                i += 64;
-            }
-
-            while n - i >= 8 {
-                unsafe {
-                    let w = read_u64_unaligned(src.add(i));
-                    write_u64_unaligned(dst.add(i), w);
-                }
-                i += 8;
-            }
+        } else {
+            i = unsafe { copy_forward_misaligned(dst, src, i, n, src_off) };
         }
     }
 
     while i < n {
         unsafe {
-            *dst.add(i) = *src.add(i);
+            *dst.add(i) = black_box(*src.add(i));
         }
         i += 1;
     }
@@ -190,7 +205,7 @@ pub unsafe fn copy_bytes(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
         return unsafe { copy_nonoverlapping_bytes(dst, src, n) };
     }
 
-    // Overlapping with dst > src: copy backwards from the end.
+    // Overlapping with dst > src: copy backwards from the end using strictly aligned word ops.
     let dst = black_box(dst);
     let src = black_box(src);
     let mut i = n;
@@ -198,57 +213,111 @@ pub unsafe fn copy_bytes(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     if i >= 16 {
         let end_misalign = (d_addr.wrapping_add(i)) & 15;
         if end_misalign != 0 {
-            let prolog = end_misalign.min(i);
-            let target = i - prolog;
+            let target = i - end_misalign;
             while i > target {
                 i -= 1;
                 unsafe {
-                    *dst.add(i) = *src.add(i);
+                    *dst.add(i) = black_box(*src.add(i));
                 }
             }
         }
 
-        while i >= 64 {
-            i -= 64;
-            unsafe {
-                let s = src.add(i);
-                let d = dst.add(i);
-                let w0 = read_u64_unaligned(s);
-                let w1 = read_u64_unaligned(s.add(8));
-                let w2 = read_u64_unaligned(s.add(16));
-                let w3 = read_u64_unaligned(s.add(24));
-                let w4 = read_u64_unaligned(s.add(32));
-                let w5 = read_u64_unaligned(s.add(40));
-                let w6 = read_u64_unaligned(s.add(48));
-                let w7 = read_u64_unaligned(s.add(56));
-                write_u64_unaligned(d.add(56), w7);
-                write_u64_unaligned(d.add(48), w6);
-                write_u64_unaligned(d.add(40), w5);
-                write_u64_unaligned(d.add(32), w4);
-                write_u64_unaligned(d.add(24), w3);
-                write_u64_unaligned(d.add(16), w2);
-                write_u64_unaligned(d.add(8), w1);
-                write_u64_unaligned(d, w0);
+        let src_off = (s_addr.wrapping_add(i)) & 7;
+        if src_off == 0 {
+            while i >= 64 {
+                i -= 64;
+                unsafe {
+                    let s = src.add(i).cast::<u64>();
+                    let d = dst.add(i).cast::<u64>();
+                    let w0 = black_box(*s);
+                    let w1 = *s.add(1);
+                    let w2 = *s.add(2);
+                    let w3 = *s.add(3);
+                    let w4 = *s.add(4);
+                    let w5 = *s.add(5);
+                    let w6 = *s.add(6);
+                    let w7 = *s.add(7);
+                    *d.add(7) = w7;
+                    *d.add(6) = w6;
+                    *d.add(5) = w5;
+                    *d.add(4) = w4;
+                    *d.add(3) = w3;
+                    *d.add(2) = w2;
+                    *d.add(1) = w1;
+                    *d = w0;
+                }
             }
-        }
 
-        while i >= 16 {
-            i -= 16;
-            unsafe {
-                let s = src.add(i);
-                let d = dst.add(i);
-                let w0 = read_u64_unaligned(s);
-                let w1 = read_u64_unaligned(s.add(8));
-                write_u64_unaligned(d.add(8), w1);
-                write_u64_unaligned(d, w0);
+            if i >= 32 {
+                i -= 32;
+                unsafe {
+                    let s = src.add(i);
+                    let d = dst.add(i);
+                    let w0 = read_u64_aligned(s);
+                    let w1 = read_u64_aligned(s.add(8));
+                    let w2 = read_u64_aligned(s.add(16));
+                    let w3 = read_u64_aligned(s.add(24));
+                    write_u64_aligned(d.add(24), w3);
+                    write_u64_aligned(d.add(16), w2);
+                    write_u64_aligned(d.add(8), w1);
+                    write_u64_aligned(d, w0);
+                }
             }
-        }
 
-        if i >= 8 {
-            i -= 8;
-            unsafe {
-                let w = read_u64_unaligned(src.add(i));
-                write_u64_unaligned(dst.add(i), w);
+            if i >= 16 {
+                i -= 16;
+                unsafe {
+                    let s = src.add(i);
+                    let d = dst.add(i);
+                    let w0 = read_u64_aligned(s);
+                    let w1 = read_u64_aligned(s.add(8));
+                    write_u64_aligned(d.add(8), w1);
+                    write_u64_aligned(d, w0);
+                }
+            }
+
+            if i >= 8 {
+                i -= 8;
+                unsafe {
+                    let w = read_u64_aligned(src.add(i));
+                    write_u64_aligned(dst.add(i), w);
+                }
+            }
+        } else if i >= 16 {
+            let k = 8 - src_off;
+            let rshift = (src_off * 8) as u32;
+            let lshift = (k * 8) as u32;
+            let mut high: u64 = 0;
+            let mut b = 0;
+            while b < src_off {
+                high |= (unsafe { *src.add(i - src_off + b) } as u64) << ((k + b) * 8);
+                b += 1;
+            }
+
+            while i >= 40 {
+                unsafe {
+                    let s_al = src.add(i - 32 - src_off);
+                    let d_al = dst.add(i - 32);
+                    let w0 = u64::from_le(read_u64_aligned(s_al));
+                    let w1 = u64::from_le(read_u64_aligned(s_al.add(8)));
+                    let w2 = u64::from_le(read_u64_aligned(s_al.add(16)));
+                    let w3 = u64::from_le(read_u64_aligned(s_al.add(24)));
+                    write_u64_aligned(d_al.add(24), ((w3 >> rshift) | high).to_le());
+                    write_u64_aligned(d_al.add(16), ((w2 >> rshift) | (w3 << lshift)).to_le());
+                    write_u64_aligned(d_al.add(8), ((w1 >> rshift) | (w2 << lshift)).to_le());
+                    write_u64_aligned(d_al, ((w0 >> rshift) | (w1 << lshift)).to_le());
+                    high = w0 << lshift;
+                }
+                i -= 32;
+            }
+
+            while i >= 16 {
+                unsafe {
+                    let w = u64::from_le(read_u64_aligned(src.add(i - 8 - src_off)));
+                    write_u64_aligned(dst.add(i - 8), ((w >> rshift) | high).to_le());
+                    high = w << lshift;
+                }
+                i -= 8;
             }
         }
     }
@@ -256,7 +325,7 @@ pub unsafe fn copy_bytes(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     while i > 0 {
         i -= 1;
         unsafe {
-            *dst.add(i) = *src.add(i);
+            *dst.add(i) = black_box(*src.add(i));
         }
     }
 
@@ -270,15 +339,15 @@ pub unsafe fn copy_bytes(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
 pub unsafe fn set_bytes(dst: *mut u8, byte: u8, n: usize) -> *mut u8 {
     let dst = black_box(dst);
     let mut i = 0;
-    let splat = LO_U64.wrapping_mul(byte as u64);
+    let splat = black_box(LO_U64.wrapping_mul(byte as u64));
 
     if n >= 16 {
         let misalign = (dst as usize) & 15;
         if misalign != 0 {
-            let prolog = (16 - misalign).min(n);
+            let prolog = (16 - misalign) & 15;
             while i < prolog {
                 unsafe {
-                    *dst.add(i) = byte;
+                    *dst.add(i) = black_box(byte);
                 }
                 i += 1;
             }
@@ -287,44 +356,49 @@ pub unsafe fn set_bytes(dst: *mut u8, byte: u8, n: usize) -> *mut u8 {
         while n - i >= 64 {
             unsafe {
                 let d = dst.add(i);
-                write_u64_unaligned(d, splat);
-                write_u64_unaligned(d.add(8), splat);
-                write_u64_unaligned(d.add(16), splat);
-                write_u64_unaligned(d.add(24), splat);
-                write_u64_unaligned(d.add(32), splat);
-                write_u64_unaligned(d.add(40), splat);
-                write_u64_unaligned(d.add(48), splat);
-                write_u64_unaligned(d.add(56), splat);
+                write_u64_aligned(d, splat);
+                write_u64_aligned(d.add(8), splat);
+                write_u64_aligned(d.add(16), splat);
+                write_u64_aligned(d.add(24), splat);
+                write_u64_aligned(d.add(32), splat);
+                write_u64_aligned(d.add(40), splat);
+                write_u64_aligned(d.add(48), splat);
+                write_u64_aligned(d.add(56), splat);
             }
             i += 64;
         }
 
-        while n - i >= 16 {
+        if n - i >= 32 {
             unsafe {
                 let d = dst.add(i);
-                write_u64_unaligned(d, splat);
-                write_u64_unaligned(d.add(8), splat);
+                write_u64_aligned(d, splat);
+                write_u64_aligned(d.add(8), splat);
+                write_u64_aligned(d.add(16), splat);
+                write_u64_aligned(d.add(24), splat);
+            }
+            i += 32;
+        }
+
+        if n - i >= 16 {
+            unsafe {
+                let d = dst.add(i);
+                write_u64_aligned(d, splat);
+                write_u64_aligned(d.add(8), splat);
             }
             i += 16;
         }
 
         if n - i >= 8 {
             unsafe {
-                write_u64_unaligned(dst.add(i), splat);
+                write_u64_aligned(dst.add(i), splat);
             }
             i += 8;
         }
-    } else if n >= 8 {
-        unsafe {
-            write_u64_unaligned(dst, splat);
-            write_u64_unaligned(dst.add(n - 8), splat);
-        }
-        return dst;
     }
 
     while i < n {
         unsafe {
-            *dst.add(i) = byte;
+            *dst.add(i) = black_box(byte);
         }
         i += 1;
     }
@@ -341,17 +415,55 @@ pub unsafe fn compare_bytes(a: *const u8, b: *const u8, n: usize) -> i32 {
     let b = black_box(b);
     let mut i = 0;
 
-    while n - i >= 8 {
-        let wa = unsafe { read_u64_unaligned(a.add(i)) };
-        let wb = unsafe { read_u64_unaligned(b.add(i)) };
-        if wa != wb {
-            let diff = u64::from_be(wa) ^ u64::from_be(wb);
-            let idx = (diff.leading_zeros() >> 3) as usize;
-            let av = unsafe { *a.add(i + idx) };
-            let bv = unsafe { *b.add(i + idx) };
-            return (av as i32) - (bv as i32);
+    if n >= 16 {
+        while i < n && ((a as usize).wrapping_add(i) & 7) != 0 {
+            let av = unsafe { *a.add(i) };
+            let bv = unsafe { *b.add(i) };
+            if av != bv {
+                return (av as i32) - (bv as i32);
+            }
+            i += 1;
         }
-        i += 8;
+
+        let b_off = ((b as usize).wrapping_add(i)) & 7;
+        if b_off == 0 {
+            while n - i >= 8 {
+                let wa = unsafe { read_u64_aligned(a.add(i)) };
+                let wb = unsafe { read_u64_aligned(b.add(i)) };
+                if wa != wb {
+                    let diff = u64::from_be(wa) ^ u64::from_be(wb);
+                    let idx = (diff.leading_zeros() >> 3) as usize;
+                    let av = unsafe { *a.add(i + idx) };
+                    let bv = unsafe { *b.add(i + idx) };
+                    return (av as i32) - (bv as i32);
+                }
+                i += 8;
+            }
+        } else if n - i >= 16 {
+            let k = 8 - b_off;
+            let rshift = (b_off * 8) as u32;
+            let lshift = (k * 8) as u32;
+            let mut low: u64 = 0;
+            let mut j = 0;
+            while j < k {
+                low |= (unsafe { *b.add(i + j) } as u64) << (j * 8);
+                j += 1;
+            }
+            while n - i >= 16 {
+                let wa = unsafe { read_u64_aligned(a.add(i)) };
+                let wb_next = u64::from_le(unsafe { read_u64_aligned(b.add(i + k)) });
+                let wb = (low | (wb_next << lshift)).to_le();
+                if wa != wb {
+                    let diff = u64::from_be(wa) ^ u64::from_be(wb);
+                    let idx = (diff.leading_zeros() >> 3) as usize;
+                    let av = unsafe { *a.add(i + idx) };
+                    let bv = unsafe { *b.add(i + idx) };
+                    return (av as i32) - (bv as i32);
+                }
+                low = wb_next >> rshift;
+                i += 8;
+            }
+        }
     }
 
     while i < n {

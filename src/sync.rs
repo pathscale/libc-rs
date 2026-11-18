@@ -154,55 +154,9 @@ impl<T: ?Sized> FutexMutex<T> {
         FutexMutexGuard { mutex: self }
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[inline]
-    fn wait_monitor_pause(&self) {
-        let ptr = self.state.as_ptr();
-        // SAFETY: `ptr` points to the valid, 4-byte aligned `AtomicU32` futex word.
-        // Uses `sevl` + bounded 4-round `ldaxr`/`wfe` exclusive monitor wait and `clrex` on exit.
-        unsafe {
-            core::arch::asm!(
-                "sevl",
-                "mov {cnt:w}, #4",
-                "1:",
-                "ldaxr {val:w}, [{ptr}]",
-                "cmp {val:w}, #1",
-                "b.ne 2f",
-                "wfe",
-                "subs {cnt:w}, {cnt:w}, #1",
-                "b.ne 1b",
-                "2:",
-                "clrex",
-                ptr = in(reg) ptr,
-                cnt = out(reg) _,
-                val = out(reg) _,
-                options(nostack),
-            );
-        }
-    }
-
     #[cold]
     fn lock_contended(&self) {
         let mut c = self.state.load(Ordering::Relaxed);
-        #[cfg(target_arch = "aarch64")]
-        {
-            if c == LOCKED_UNCONTENDED {
-                self.wait_monitor_pause();
-                c = self.state.load(Ordering::Relaxed);
-            }
-            if c == UNLOCKED {
-                match self.state.compare_exchange(
-                    UNLOCKED,
-                    LOCKED_UNCONTENDED,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return,
-                    Err(prev) => c = prev,
-                }
-            }
-        }
-        #[cfg(not(target_arch = "aarch64"))]
         for _ in 0..32 {
             if c == UNLOCKED {
                 match self.state.compare_exchange(
