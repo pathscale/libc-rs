@@ -34,7 +34,7 @@ pub unsafe fn copy_nonoverlapping_bytes(dst: *mut u8, src: *const u8, n: usize) 
             unsafe {
                 let d_word = dst.add(i).cast::<usize>();
                 let s_word = src.add(i).cast::<usize>();
-                d_word.write(s_word.read());
+                *d_word = *s_word;
             }
             compiler_barrier();
             i += word_size;
@@ -92,11 +92,11 @@ pub unsafe fn set_bytes(dst: *mut u8, byte: u8, n: usize) -> *mut u8 {
     let align_mask = word_size - 1;
 
     if n >= word_size && (dst as usize & align_mask) == 0 {
-        let splat = usize::from_ne_bytes([byte; size_of::<usize>()]);
+        let splat = (usize::MAX / 0xFF).wrapping_mul(byte as usize);
         let word_end = n & !align_mask;
         while i < word_end {
             unsafe {
-                dst.add(i).cast::<usize>().write(splat);
+                *dst.add(i).cast::<usize>() = splat;
             }
             compiler_barrier();
             i += word_size;
@@ -126,6 +126,7 @@ pub unsafe fn compare_bytes(a: *const u8, b: *const u8, n: usize) -> i32 {
         if av != bv {
             return (av as i32) - (bv as i32);
         }
+        compiler_barrier();
         i += 1;
     }
     0
@@ -138,6 +139,7 @@ pub unsafe fn compare_bytes(a: *const u8, b: *const u8, n: usize) -> i32 {
 pub unsafe fn c_strlen(s: *const u8) -> usize {
     let mut len = 0;
     while unsafe { *s.add(len) } != 0 {
+        compiler_barrier();
         len += 1;
     }
     len
@@ -150,6 +152,7 @@ pub unsafe fn c_strlen(s: *const u8) -> usize {
 pub unsafe fn c_strnlen(s: *const u8, max_len: usize) -> usize {
     let mut len = 0;
     while len < max_len && unsafe { *s.add(len) } != 0 {
+        compiler_barrier();
         len += 1;
     }
     len
@@ -198,7 +201,7 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// # Safety
 /// - `src` must be valid for reads of `n` bytes, and `dst` for writes of `n` bytes.
 /// - The memory regions must not overlap.
-#[cfg(feature = "symbols")]
+#[cfg(all(feature = "symbols", target_os = "none"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcpy(
     dst: *mut core::ffi::c_void,
@@ -212,7 +215,7 @@ pub unsafe extern "C" fn memcpy(
 ///
 /// # Safety
 /// - `src` must be valid for reads of `n` bytes, and `dst` for writes of `n` bytes.
-#[cfg(feature = "symbols")]
+#[cfg(all(feature = "symbols", target_os = "none"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memmove(
     dst: *mut core::ffi::c_void,
@@ -226,7 +229,7 @@ pub unsafe extern "C" fn memmove(
 ///
 /// # Safety
 /// - `dst` must be valid for writes of `n` bytes.
-#[cfg(feature = "symbols")]
+#[cfg(all(feature = "symbols", target_os = "none"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memset(
     dst: *mut core::ffi::c_void,
@@ -240,7 +243,7 @@ pub unsafe extern "C" fn memset(
 ///
 /// # Safety
 /// - `a` and `b` must each be valid for reads of `n` bytes.
-#[cfg(feature = "symbols")]
+#[cfg(all(feature = "symbols", target_os = "none"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcmp(
     a: *const core::ffi::c_void,
@@ -254,7 +257,7 @@ pub unsafe extern "C" fn memcmp(
 ///
 /// # Safety
 /// - `a` and `b` must each be valid for reads of `n` bytes.
-#[cfg(feature = "symbols")]
+#[cfg(all(feature = "symbols", target_os = "none"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bcmp(
     a: *const core::ffi::c_void,
@@ -268,7 +271,7 @@ pub unsafe extern "C" fn bcmp(
 ///
 /// # Safety
 /// - `s` must point to a valid NUL-terminated string.
-#[cfg(feature = "symbols")]
+#[cfg(all(feature = "symbols", target_os = "none"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strlen(s: *const core::ffi::c_char) -> usize {
     unsafe { c_strlen(s.cast::<u8>()) }
@@ -278,7 +281,7 @@ pub unsafe extern "C" fn strlen(s: *const core::ffi::c_char) -> usize {
 ///
 /// # Safety
 /// - `s` must be valid for reads up to `max_len` bytes or the first NUL byte.
-#[cfg(feature = "symbols")]
+#[cfg(all(feature = "symbols", target_os = "none"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strnlen(s: *const core::ffi::c_char, max_len: usize) -> usize {
     unsafe { c_strnlen(s.cast::<u8>(), max_len) }
