@@ -17,6 +17,7 @@ pub const UK_PR_REACTIVE_CLOSE: usize = 0x5245_0005;
 pub const UK_REACTIVE_CTL_ADD: u32 = 1;
 pub const UK_REACTIVE_CTL_MOD: u32 = 2;
 pub const UK_REACTIVE_CTL_DEL: u32 = 3;
+pub const UK_REACTIVE_CTL_RESYNC: u32 = 4;
 
 const CLOCK_MONOTONIC: usize = 1;
 
@@ -128,7 +129,8 @@ impl ReactiveRing {
         .map(|_| ())
     }
 
-    /// Drain events and `user_wake` / `overflow` directly from shared memory with ZERO syscalls.
+    /// Drain events and `user_wake` / `overflow` directly from shared memory with ZERO syscalls
+    /// in the steady state (calling `UK_REACTIVE_CTL_RESYNC` only if ring overflow occurred).
     pub fn drain(&self, out: &mut [UkReactiveEvent]) -> (usize, bool, bool) {
         let header = self.header();
         let user_wake = header.user_wake.swap(0, Ordering::AcqRel) != 0;
@@ -147,6 +149,22 @@ impl ReactiveRing {
         }
         if count > 0 {
             header.head.store(head, Ordering::Release);
+        }
+        if overflow {
+            let _ = self.ctl(UK_REACTIVE_CTL_RESYNC, 0, 0, 0);
+            if count < out.len() {
+                let mut head2 = header.head.load(Ordering::Relaxed);
+                let tail2 = header.tail.load(Ordering::Acquire);
+                while head2 != tail2 && count < out.len() {
+                    let idx = (head2 & mask) as usize;
+                    out[count] = unsafe { self.events_ptr().add(idx).read() };
+                    head2 = head2.wrapping_add(1);
+                    count += 1;
+                }
+                if head2 != header.head.load(Ordering::Relaxed) {
+                    header.head.store(head2, Ordering::Release);
+                }
+            }
         }
         (count, user_wake, overflow)
     }
