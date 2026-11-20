@@ -13,7 +13,7 @@ use crate::mm::{
 };
 
 pub const MAX_TLS_KEYS: usize = 64;
-pub const DEFAULT_STACK_BYTES: usize = 512 * 1024;
+pub const DEFAULT_STACK_BYTES: usize = 2 * 1024 * 1024;
 pub const MIN_STACK_BYTES: usize = 64 * 1024;
 
 pub const CLONE_VM: u64 = 0x0000_0100;
