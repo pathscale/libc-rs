@@ -157,24 +157,6 @@ impl<T: ?Sized> FutexMutex<T> {
     #[cold]
     fn lock_contended(&self) {
         let mut c = self.state.load(Ordering::Relaxed);
-        for _ in 0..32 {
-            if c == UNLOCKED {
-                match self.state.compare_exchange(
-                    UNLOCKED,
-                    LOCKED_UNCONTENDED,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return,
-                    Err(prev) => c = prev,
-                }
-            }
-            if c != LOCKED_UNCONTENDED {
-                break;
-            }
-            core::hint::spin_loop();
-            c = self.state.load(Ordering::Relaxed);
-        }
         loop {
             if c == LOCKED_CONTENDED
                 || self

@@ -23,6 +23,7 @@ pub mod poll;
 pub mod process;
 pub mod rand;
 pub mod raw;
+pub mod reactive;
 pub mod startup;
 pub mod sync;
 pub mod thread;
