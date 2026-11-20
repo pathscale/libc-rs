@@ -1,6 +1,6 @@
 [package]
 name = "libc-rs"
-version = "0.2.5"
+version = "0.2.6"
 publish = ["crates-io"]
 edition = "2024"
 rust-version = "1.85"
